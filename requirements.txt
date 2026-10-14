@@ -6,3 +6,4 @@ matplotlib
 python-docx
 reportlab
 Pillow
+openai
