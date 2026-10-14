@@ -17,42 +17,24 @@ st.set_page_config(
 
 st.title("📘 AI Project Report Generator")
 st.write(
-    "Search academic research and generate project-report "
-    "chapters with AI."
+    "Search academic research and generate project report chapters using AI."
 )
 
 # --------------------------------------------------
-# CONFIGURATION
+# SECRETS AND CONFIGURATION
 # --------------------------------------------------
 
-OPENALEX_URL = "https://api.openalex.org/works"
-
 try:
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+    OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
     OPENAI_MODEL = st.secrets.get(
         "OPENAI_MODEL",
         "gpt-4.1-mini"
     )
 except Exception:
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    OPENAI_MODEL = os.getenv(
-        "OPENAI_MODEL",
-        "gpt-4.1-mini"
-    )
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-
-# --------------------------------------------------
-# OPENAI CLIENT
-# --------------------------------------------------
-
-def get_openai_client():
-    if not OPENAI_API_KEY:
-        raise ValueError(
-            "OpenAI API key is missing. Add OPENAI_API_KEY "
-            "to Streamlit Cloud Secrets."
-        )
-
-    return OpenAI(api_key=OPENAI_API_KEY)
+OPENALEX_URL = "https://api.openalex.org/works"
 
 
 # --------------------------------------------------
@@ -60,106 +42,79 @@ def get_openai_client():
 # --------------------------------------------------
 
 def decode_abstract(inverted_index):
-    """Convert an OpenAlex inverted-index abstract into text."""
-
     if not inverted_index:
         return "Abstract not available."
 
     try:
-        word_positions = []
+        words = []
 
         for word, positions in inverted_index.items():
             for position in positions:
-                word_positions.append((position, word))
+                words.append((position, word))
 
-        word_positions.sort(key=lambda item: item[0])
+        words.sort(key=lambda item: item[0])
 
-        abstract = " ".join(
-            word for _, word in word_positions
-        )
-
-        return abstract or "Abstract not available."
+        return " ".join(word for _, word in words)
 
     except (AttributeError, TypeError, ValueError):
         return "Abstract not available."
 
 
 # --------------------------------------------------
-# OPENALEX RESEARCH SEARCH
+# OPENALEX SEARCH WITH RATE-LIMIT RETRIES
 # --------------------------------------------------
 
 def search_research(search_topic, max_results=10):
-    """Search OpenAlex, retrying temporary rate limits."""
-
     params = {
         "search": search_topic,
         "per-page": max_results,
         "sort": "relevance_score:desc"
     }
 
-    last_response = None
+    response = None
 
     for attempt in range(3):
-        try:
-            response = requests.get(
-                OPENALEX_URL,
-                params=params,
-                timeout=30,
-                headers={
-                    "User-Agent":
-                        "AIProjectReportGenerator/1.0"
-                }
-            )
-
-            last_response = response
-
-            if response.status_code != 429:
-                response.raise_for_status()
-                break
-
-            if attempt < 2:
-                time.sleep(5 * (attempt + 1))
-
-        except requests.RequestException:
-            raise
-
-    if last_response is None:
-        raise RuntimeError(
-            "No response received from OpenAlex."
+        response = requests.get(
+            OPENALEX_URL,
+            params=params,
+            timeout=30,
+            headers={
+                "User-Agent": "AIProjectReportGenerator/1.0"
+            }
         )
 
-    last_response.raise_for_status()
-    data = last_response.json()
+        if response.status_code != 429:
+            break
+
+        if attempt < 2:
+            time.sleep(5 * (attempt + 1))
+
+    response.raise_for_status()
+    data = response.json()
 
     results = []
 
     for work in data.get("results", []):
-        title = work.get("title") or "Untitled research paper"
-
-        authorships = work.get("authorships", [])
         authors = []
 
-        for authorship in authorships:
+        for authorship in work.get("authorships", []):
             author = authorship.get("author", {})
             name = author.get("display_name")
 
             if name:
                 authors.append(name)
 
-        publication_year = work.get("publication_year")
         doi = work.get("doi")
         openalex_id = work.get("id")
 
-        abstract = decode_abstract(
-            work.get("abstract_inverted_index")
-        )
-
         results.append({
-            "Title": title,
+            "Title": work.get("title") or "Untitled research paper",
             "Authors": ", ".join(authors) or "Authors not listed",
-            "Year": publication_year or "Unknown",
-            "Abstract": abstract,
-            "DOI": doi or "Not listed",
+            "Year": work.get("publication_year") or "Unknown",
+            "Abstract": decode_abstract(
+                work.get("abstract_inverted_index")
+            ),
+            "DOI": doi or "",
             "URL": doi or openalex_id or ""
         })
 
@@ -167,7 +122,7 @@ def search_research(search_topic, max_results=10):
 
 
 # --------------------------------------------------
-# AI CHAPTER GENERATION
+# OPENAI CHAPTER GENERATION
 # --------------------------------------------------
 
 def generate_chapter(
@@ -175,34 +130,35 @@ def generate_chapter(
     chapter_name,
     research_context
 ):
-    """Generate a report chapter using the OpenAI API."""
+    if not OPENAI_API_KEY:
+        raise ValueError(
+            "OpenAI API key is missing from Streamlit Secrets."
+        )
 
-    client = get_openai_client()
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
     prompt = f"""
-You are an academic project-report writing assistant.
+You are an academic project report writing assistant.
 
 Project title:
 {project_title}
 
-Chapter to write:
+Chapter:
 {chapter_name}
 
-Research sources supplied by the user:
+Research sources:
 {research_context}
 
-Instructions:
-1. Write a clear, formal academic chapter.
-2. Use headings and subheadings where appropriate.
-3. Use only information supported by the supplied sources
-   or clearly established general knowledge.
-4. Do not invent research papers, authors, statistics,
-   quotations, DOI numbers, or citations.
-5. If the supplied research is insufficient, state the
-   limitation instead of inventing details.
-6. Distinguish proposed methods from completed experiments.
-7. Include a short conclusion for the chapter.
-8. Make the output suitable for an academic project report.
+Write a clear, formal academic chapter with suitable headings.
+
+Requirements:
+- Use the supplied research sources where relevant.
+- Do not invent authors, papers, citations, statistics, or results.
+- Clearly identify limitations when information is insufficient.
+- Distinguish proposed work from experiments already completed.
+- Do not claim that the user performed experiments unless stated.
+- Finish with a short chapter conclusion.
+- Make the writing appropriate for an academic project report.
 """
 
     response = client.responses.create(
@@ -220,8 +176,8 @@ Instructions:
 st.sidebar.header("⚙️ Report Settings")
 
 max_results = st.sidebar.selectbox(
-    "Research papers to retrieve",
-    options=[5, 10, 15, 20],
+    "Number of research papers",
+    [5, 10, 15, 20],
     index=1
 )
 
@@ -238,8 +194,8 @@ chapter_options = [
 ]
 
 selected_chapters = st.sidebar.multiselect(
-    "Choose report chapters",
-    options=chapter_options,
+    "Select report chapters",
+    chapter_options,
     default=[
         "Abstract",
         "Introduction",
@@ -249,28 +205,6 @@ selected_chapters = st.sidebar.multiselect(
         "Proposed Methodology",
         "Conclusion"
     ]
-)
-
-
-# --------------------------------------------------
-# PROJECT INPUT
-# --------------------------------------------------
-
-st.header("1. Project Details")
-
-project_title = st.text_input(
-    "Project title",
-    placeholder="e.g. Artificial Intelligence in Manufacturing"
-)
-
-search_topic = st.text_input(
-    "Research search topic",
-    placeholder="e.g. AI applications in manufacturing"
-)
-
-search_button = st.button(
-    "🔎 Search Research Sources",
-    type="primary"
 )
 
 
@@ -289,25 +223,45 @@ if "generated_chapters" not in st.session_state:
 
 
 # --------------------------------------------------
-# RUN RESEARCH SEARCH
+# PROJECT DETAILS
+# --------------------------------------------------
+
+st.header("1. Project Details")
+
+project_title = st.text_input(
+    "Project title",
+    placeholder="Artificial Intelligence in Manufacturing"
+)
+
+search_topic = st.text_input(
+    "Research topic",
+    placeholder="AI applications in manufacturing"
+)
+
+search_button = st.button(
+    "🔎 Search Research Sources",
+    type="primary"
+)
+
+
+# --------------------------------------------------
+# SEARCH RESEARCH SOURCES
 # --------------------------------------------------
 
 if search_button:
     if not search_topic.strip():
-        st.warning("Please enter a research search topic.")
+        st.warning("Please enter a research topic.")
 
     else:
-        with st.spinner("Searching OpenAlex research sources..."):
+        with st.spinner("Searching academic research sources..."):
             try:
                 results = search_research(
                     search_topic.strip(),
-                    max_results=max_results
+                    max_results
                 )
 
                 st.session_state.research_results = results
-                st.session_state.last_search_topic = (
-                    search_topic.strip()
-                )
+                st.session_state.last_search_topic = search_topic.strip()
 
                 if results:
                     st.success(
@@ -315,7 +269,7 @@ if search_button:
                     )
                 else:
                     st.info(
-                        "No results were found. Try a broader topic."
+                        "No results found. Try a broader search topic."
                     )
 
             except requests.HTTPError as error:
@@ -328,7 +282,7 @@ if search_button:
                 if status == 429:
                     st.error(
                         "OpenAlex is rate-limiting requests (HTTP 429). "
-                        "Please wait a few minutes before trying again."
+                        "Wait a few minutes before trying again."
                     )
                 else:
                     st.error(
@@ -342,8 +296,8 @@ if search_button:
 
             except requests.ConnectionError:
                 st.error(
-                    "Could not connect to OpenAlex. "
-                    "Check the connection or try again later."
+                    "Could not connect to OpenAlex. Check your connection "
+                    "or try again later."
                 )
 
             except requests.RequestException as error:
@@ -353,12 +307,12 @@ if search_button:
 
             except Exception as error:
                 st.error(
-                    f"Unexpected research error: {type(error).__name__}"
+                    f"Unexpected error: {type(error).__name__}"
                 )
 
 
 # --------------------------------------------------
-# DISPLAY RESEARCH RESULTS
+# DISPLAY RESEARCH SOURCES
 # --------------------------------------------------
 
 if st.session_state.research_results:
@@ -380,14 +334,14 @@ if st.session_state.research_results:
             st.write("**Abstract:**")
             st.write(paper["Abstract"])
 
-            if paper["DOI"] != "Not listed":
+            if paper["DOI"]:
                 st.markdown(
                     f"**DOI:** [{paper['DOI']}]({paper['DOI']})"
                 )
-
             elif paper["URL"]:
                 st.markdown(
-                    f"**Source:** [{paper['URL']}]({paper['URL']})"
+                    f"**OpenAlex record:** [{paper['URL']}]"
+                    f"({paper['URL']})"
                 )
 
 
@@ -399,11 +353,14 @@ st.header("3. Generate Project Report")
 
 if not OPENAI_API_KEY:
     st.warning(
-        "OpenAI API key is not configured. Add "
-        "OPENAI_API_KEY in Streamlit Cloud → App settings → Secrets."
+        "OpenAI API key is not configured. Add OPENAI_API_KEY "
+        "in Streamlit Cloud → App settings → Secrets."
     )
 
-if st.button("✨ Generate Selected Chapters", type="primary"):
+if st.button(
+    "✨ Generate Selected Chapters",
+    type="primary"
+):
     if not project_title.strip():
         st.warning("Please enter your project title.")
 
@@ -427,21 +384,22 @@ if st.button("✨ Generate Selected Chapters", type="primary"):
                     f"Title: {paper['Title']}\n"
                     f"Authors: {paper['Authors']}\n"
                     f"Year: {paper['Year']}\n"
-                    f"DOI: {paper['DOI']}\n"
+                    f"DOI: {paper['DOI'] or 'Not listed'}\n"
                     f"Abstract: {paper['Abstract']}"
                 )
                 for paper in st.session_state.research_results
             ]
         )
 
-        progress = st.progress(0)
-        status_text = st.empty()
         generated = {}
         failed = []
 
+        progress = st.progress(0)
+        status_text = st.empty()
+
         for index, chapter in enumerate(selected_chapters):
             status_text.write(
-                f"Generating chapter: {chapter}..."
+                f"Generating: {chapter}..."
             )
 
             try:
@@ -478,11 +436,13 @@ if st.button("✨ Generate Selected Chapters", type="primary"):
 
 
 # --------------------------------------------------
-# DISPLAY GENERATED CHAPTERS
+# DISPLAY AND DOWNLOAD REPORT
 # --------------------------------------------------
 
 if st.session_state.generated_chapters:
     st.header("4. Generated Report")
+
+    report_parts = []
 
     for chapter, content in (
         st.session_state.generated_chapters.items()
@@ -500,13 +460,13 @@ if st.session_state.generated_chapters:
                 key=f"download_{chapter}"
             )
 
-    complete_report = "\n\n".join(
-        [
+        report_parts.append(
             f"# {chapter}\n\n{content}"
-            for chapter, content in (
-                st.session_state.generated_chapters.items()
-            )
-        ]
+        )
+
+    complete_report = (
+        f"# {project_title.strip()}\n\n"
+        + "\n\n".join(report_parts)
     )
 
     st.download_button(
@@ -525,7 +485,7 @@ if st.session_state.generated_chapters:
 st.divider()
 
 st.caption(
-    "AI Project Report Generator | Verify sources and "
+    "AI Project Report Generator | Verify research sources and "
     "review AI-generated content before academic submission."
 )
 ```
