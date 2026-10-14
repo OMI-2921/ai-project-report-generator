@@ -1,4 +1,3 @@
-
 streamlit
 requests
 pandas
@@ -6,5 +5,5 @@ matplotlib
 python-docx
 reportlab
 Pillow
-openai
 google-genai
+graphviz
