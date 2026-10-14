@@ -1,1137 +1,1500 @@
 
+import io
 import os
 import re
-import time
-import html
 import textwrap
-from io import BytesIO
+from datetime import datetime
 from xml.sax.saxutils import escape
 
-import requests
-import streamlit as st
-import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 
+import pandas as pd
+import requests
+import streamlit as st
 from google import genai
 from docx import Document
-from docx.shared import Inches as DocxInches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, PageBreak,
-    Image as PDFImage, Table, TableStyle, KeepTogether
-)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.units import inch
+from docx.shared import Inches, Pt
 from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    PageBreak,
+    Image as PDFImage,
+    Table,
+    TableStyle,
+    KeepTogether,
+)
 
 
-# ==================================================
-# 1. PAGE CONFIGURATION
-# ==================================================
+# ---------------------------------------------------------
+# APP CONFIGURATION
+# ---------------------------------------------------------
 
 st.set_page_config(
     page_title="AI Project Report Generator",
-    page_icon="📚",
-    layout="wide"
+    page_icon="📘",
+    layout="wide",
 )
 
-st.title("📚 AI Project Report Generator")
-st.write(
-    "Generate structured student project reports with academic "
-    "sources, diagrams, charts, and downloadable Word and PDF files."
-)
-
-
-# ==================================================
-# 2. SETTINGS
-# ==================================================
-
-def get_setting(name, default=""):
-    try:
-        value = st.secrets.get(name, default)
-        return str(value).strip() if value else default
-    except Exception:
-        return os.getenv(name, default)
-
-
-GEMINI_API_KEY = get_setting("GEMINI_API_KEY")
-GEMINI_MODEL = get_setting("GEMINI_MODEL", "gemini-3.5-flash-lite")
-
-if not GEMINI_API_KEY:
-    st.error(
-        "Gemini API key not found. Add GEMINI_API_KEY in "
-        "Streamlit Settings → Secrets."
-    )
-    st.stop()
-
-try:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-except Exception as exc:
-    st.error(f"Could not initialize Gemini: {exc}")
-    st.stop()
-
-HEADERS = {
-    "User-Agent": "AIProjectReportGenerator/2.0"
-}
-
-
-# ==================================================
-# 3. ACADEMIC SOURCE SEARCH
-# ==================================================
-
-def decode_abstract(inverted_index):
-    if not inverted_index:
-        return ""
-
-    words = {}
-    for word, positions in inverted_index.items():
-        for position in positions:
-            words[position] = word
-
-    return " ".join(words[position] for position in sorted(words))
-
-
-def search_openalex(topic, limit):
-    try:
-        response = requests.get(
-            "https://api.openalex.org/works",
-            params={
-                "search": topic,
-                "per-page": limit,
-                "select": (
-                    "id,doi,title,publication_year,authorships,"
-                    "abstract_inverted_index,primary_location"
-                )
-            },
-            headers=HEADERS,
-            timeout=25
-        )
-        response.raise_for_status()
-
-        results = []
-        for item in response.json().get("results", []):
-            authors = []
-            for authorship in item.get("authorships", [])[:10]:
-                name = (authorship.get("author") or {}).get("display_name")
-                if name:
-                    authors.append(name)
-
-            location = item.get("primary_location") or {}
-            source = location.get("source") or {}
-            doi = item.get("doi") or ""
-
-            results.append({
-                "title": item.get("title") or "Untitled",
-                "year": item.get("publication_year") or "Unknown",
-                "authors": authors,
-                "journal": source.get("display_name", ""),
-                "doi": doi,
-                "url": doi or item.get("id", ""),
-                "abstract": decode_abstract(
-                    item.get("abstract_inverted_index")
-                ),
-                "source_provider": "OpenAlex"
-            })
-
-        return results
-
-    except requests.RequestException:
-        return []
-
-
-def search_crossref(topic, limit):
-    try:
-        response = requests.get(
-            "https://api.crossref.org/works",
-            params={"query": topic, "rows": limit},
-            headers=HEADERS,
-            timeout=25
-        )
-        response.raise_for_status()
-
-        results = []
-        items = response.json().get("message", {}).get("items", [])
-
-        for item in items:
-            title_list = item.get("title") or []
-            title = title_list[0] if title_list else "Untitled"
-
-            authors = []
-            for author in item.get("author", [])[:10]:
-                name = " ".join(
-                    part for part in (
-                        author.get("given", ""),
-                        author.get("family", "")
-                    ) if part
-                )
-                if name:
-                    authors.append(name)
-
-            date_parts = (
-                item.get("published", {}).get("date-parts")
-                or item.get("published-print", {}).get("date-parts")
-                or item.get("created", {}).get("date-parts")
-                or []
-            )
-
-            year = (
-                date_parts[0][0]
-                if date_parts and date_parts[0]
-                else "Unknown"
-            )
-
-            doi = item.get("DOI", "")
-            abstract = item.get("abstract", "")
-            abstract = re.sub(r"<[^>]+>", " ", abstract)
-            abstract = html.unescape(abstract)
-            abstract = re.sub(r"\s+", " ", abstract).strip()
-
-            results.append({
-                "title": title,
-                "year": year,
-                "authors": authors,
-                "journal": (
-                    (item.get("container-title") or [""])[0]
-                ),
-                "doi": doi,
-                "url": (
-                    f"https://doi.org/{doi}"
-                    if doi else item.get("URL", "")
-                ),
-                "abstract": abstract,
-                "source_provider": "Crossref"
-            })
-
-        return results
-
-    except requests.RequestException:
-        return []
-
-
-def search_research(topic, limit):
-    papers = search_openalex(topic, limit)
-    if papers:
-        return papers, "OpenAlex"
-
-    papers = search_crossref(topic, limit)
-    if papers:
-        return papers, "Crossref"
-
-    return [], None
-
-
-def usable_sources(papers):
-    """Prefer sources with identifiable titles and author metadata."""
-    cleaned = []
-    seen = set()
-
-    for paper in papers:
-        title = (paper.get("title") or "").strip()
-        url = (paper.get("url") or "").strip()
-
-        if not title or title == "Untitled":
-            continue
-
-        key = (title.lower(), url.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-
-        cleaned.append(paper)
-
-    return cleaned
-
-
-def format_authors(authors):
-    if not authors:
-        return "Author metadata unavailable"
-
-    if len(authors) == 1:
-        return authors[0]
-
-    if len(authors) == 2:
-        return f"{authors[0]} and {authors[1]}"
-
-    return ", ".join(authors[:-1]) + ", and " + authors[-1]
-
-
-def format_reference(paper):
-    authors = format_authors(paper.get("authors", []))
-    year = paper.get("year", "Unknown")
-    title = paper.get("title", "Untitled")
-    journal = paper.get("journal", "")
-    url = paper.get("url", "")
-
-    parts = [f"{authors} ({year}). {title}."]
-
-    if journal:
-        parts.append(f"{journal}.")
-
-    if url:
-        parts.append(url)
-
-    return " ".join(parts)
-
-
-def build_source_context(papers):
-    blocks = []
-
-    for i, paper in enumerate(papers, start=1):
-        blocks.append(
-            f"SOURCE {i}\n"
-            f"Title: {paper['title']}\n"
-            f"Authors: {format_authors(paper.get('authors', []))}\n"
-            f"Year: {paper.get('year', 'Unknown')}\n"
-            f"Journal: {paper.get('journal', '')}\n"
-            f"DOI or URL: {paper.get('url', '')}\n"
-            f"Abstract: {(paper.get('abstract') or 'Not available')[:1000]}\n"
-        )
-
-    return "\n".join(blocks)
-
-
-# ==================================================
-# 4. REPORT GENERATION
-# ==================================================
+APP_TITLE = "AI Project Report Generator"
 
 DEFAULT_CHAPTERS = [
     "Abstract",
     "Introduction",
-    "Problem Statement",
-    "Objectives",
-    "Scope of the Project",
+    "Problem Statement and Objectives",
     "Literature Review",
-    "Proposed Methodology",
+    "Methodology",
     "System Design",
     "Implementation",
     "Testing and Evaluation",
     "Results and Discussion",
-    "Limitations",
-    "Future Scope",
-    "Conclusion",
-    "References"
+    "Conclusion and Future Scope",
 ]
 
+WORD_LIMITS = {
+    "Concise": 250,
+    "Balanced": 330,
+    "Detailed": 400,
+}
 
-def generate_report(
-    topic,
-    project_type,
-    academic_level,
-    word_count,
-    instructions,
-    chapters,
-    source_context,
-    project_details
-):
-    chapter_list = "\n".join(f"- {chapter}" for chapter in chapters)
+STYLE_OPTIONS = ["Compact", "Standard", "Detailed"]
 
-    prompt = f"""
-You are an academic project-report writing assistant.
-
-PROJECT TOPIC: {topic}
-PROJECT TYPE: {project_type}
-ACADEMIC LEVEL: {academic_level}
-TARGET WORDS PER CHAPTER: approximately {word_count}
-
-STUDENT-PROVIDED PROJECT DETAILS:
-{project_details or "No implementation details supplied."}
-
-ADDITIONAL INSTRUCTIONS:
-{instructions or "None"}
-
-REQUESTED CHAPTERS, IN THIS ORDER:
-{chapter_list}
-
-ACADEMIC SOURCES RETRIEVED FROM OPENALEX OR CROSSREF:
-{source_context or "No academic sources retrieved."}
-
-Write a substantial, well-organized project report in formal academic
-English. Use meaningful headings and subheadings.
-
-Separate every requested chapter with the exact marker:
-<<<CHAPTER: Chapter Name>>>
-
-Repeat the marker for every requested chapter, preserving the exact names
-and order supplied above.
-
-ACADEMIC INTEGRITY:
-- Do not invent experiments, results, sample sizes, performance scores,
-  survey responses, authors, or publication details.
-- If the project has not been implemented, clearly describe implementation
-  as proposed or planned rather than completed.
-- In Results and Discussion, if no real results or dataset are provided,
-  state that empirical results are not yet available. Explain what should
-  be measured instead of inventing numerical results.
-- Cite sources in the text using author and year only when the source
-  metadata supports that citation.
-- Never invent a citation to support a statement.
-- In References, list only supplied sources that are relevant to the topic.
-  Do not use "Authors not listed" as an author name. If author metadata is
-  unavailable, clearly label it "Author metadata unavailable".
-- Do not claim a source proves something if its abstract or contents do
-  not support that claim.
-- Avoid repeating identical paragraphs across chapters.
-- Adapt the report to the selected project type.
-- For software projects, explain modules, architecture, inputs, outputs,
-  and testing plans.
-- For data projects, explain data sources, preprocessing, methods, metrics,
-  and evaluation requirements.
-- For business projects, include the relevant business framework and
-  evaluation approach.
-- For engineering projects, explain components, design considerations,
-  and validation requirements.
-- Do not pretend that a diagram or chart has been included; describe its
-  purpose in the report text if relevant.
-- Return only the report with chapter markers.
-"""
-
-    last_error = None
-
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt
-            )
-
-            result = response.text
-            if result and result.strip():
-                return result.strip()
-
-            raise ValueError("Gemini returned an empty response.")
-
-        except Exception as exc:
-            last_error = exc
-            message = str(exc).lower()
-
-            if (
-                ("503" in message or "unavailable" in message)
-                and attempt < 2
-            ):
-                time.sleep(5 * (attempt + 1))
-                continue
-
-            raise
-
-    raise last_error
+st.title("📘 AI Project Report Generator")
+st.write(
+    "Create a structured project report with references, diagrams, "
+    "optional data charts, and PDF, Word, and text exports."
+)
 
 
-def split_chapters(report_text, requested_chapters):
-    pattern = r"<<<CHAPTER:\s*(.*?)\s*>>>"
-    matches = list(re.finditer(pattern, report_text, re.IGNORECASE))
+# ---------------------------------------------------------
+# RESEARCH SOURCE SEARCH
+# ---------------------------------------------------------
 
-    if not matches:
-        return {"Complete Report": report_text.strip()}
+def search_openalex(query, max_results=6):
+    """Search OpenAlex for potentially relevant scholarly works."""
+    if not query.strip():
+        return []
 
-    result = {}
+    url = "https://api.openalex.org/works"
+    params = {
+        "search": query,
+        "per-page": max_results,
+        "select": (
+            "id,doi,title,publication_year,authorships,"
+            "primary_location,type"
+        ),
+    }
 
-    for i, match in enumerate(matches):
-        name = match.group(1).strip()
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(report_text)
-        content = report_text[start:end].strip()
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        results = response.json().get("results", [])
+    except (requests.RequestException, ValueError):
+        return []
 
-        canonical = next(
-            (c for c in requested_chapters if c.lower() == name.lower()),
-            name
+    sources = []
+    for item in results:
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+
+        authors = []
+        for authorship in item.get("authorships") or []:
+            author = (
+                authorship.get("author", {}).get("display_name") or ""
+            ).strip()
+            if author:
+                authors.append(author)
+
+        location = item.get("primary_location") or {}
+        source = location.get("source") or {}
+        journal = (source.get("display_name") or "").strip()
+
+        sources.append({
+            "title": title,
+            "authors": authors,
+            "year": item.get("publication_year"),
+            "journal": journal,
+            "doi": item.get("doi"),
+            "url": item.get("doi") or item.get("id") or "",
+        })
+
+    return sources
+
+
+def search_crossref(query, max_results=6):
+    """Fallback scholarly search using Crossref."""
+    if not query.strip():
+        return []
+
+    try:
+        response = requests.get(
+            "https://api.crossref.org/works",
+            params={"query.bibliographic": query, "rows": max_results},
+            timeout=15,
+            headers={"User-Agent": "AIProjectReportGenerator/1.0"},
         )
+        response.raise_for_status()
+        items = response.json().get("message", {}).get("items", [])
+    except (requests.RequestException, ValueError):
+        return []
 
-        if content:
-            result[canonical] = content
+    sources = []
+    for item in items:
+        title_list = item.get("title") or []
+        title = title_list[0].strip() if title_list else ""
+        if not title:
+            continue
 
-    return result or {"Complete Report": report_text.strip()}
+        authors = []
+        for author in item.get("author") or []:
+            given = (author.get("given") or "").strip()
+            family = (author.get("family") or "").strip()
+            name = " ".join(part for part in [given, family] if part)
+            if name:
+                authors.append(name)
+
+        date_parts = (
+            item.get("published-print", {}).get("date-parts")
+            or item.get("published-online", {}).get("date-parts")
+            or item.get("created", {}).get("date-parts")
+            or []
+        )
+        year = date_parts[0][0] if date_parts and date_parts[0] else None
+
+        doi = item.get("DOI")
+        url = f"https://doi.org/{doi}" if doi else item.get("URL", "")
+        container = item.get("container-title") or []
+
+        sources.append({
+            "title": title,
+            "authors": authors,
+            "year": year,
+            "journal": container[0] if container else "",
+            "doi": doi,
+            "url": url,
+        })
+
+    return sources
 
 
-# ==================================================
-# 5. AUTOMATIC DIAGRAMS AND CHARTS
-# ==================================================
+def search_references(query, max_results=8):
+    """Search OpenAlex first, then use Crossref as a fallback."""
+    sources = search_openalex(query, max_results=max_results)
 
-def make_workflow_diagram(topic, project_type):
-    """Create a generic workflow diagram, not a claim about completed work."""
+    if len(sources) < 3:
+        crossref_sources = search_crossref(
+            query, max_results=max_results
+        )
+        existing_titles = {
+            normalize_title(source["title"]) for source in sources
+        }
+
+        for source in crossref_sources:
+            key = normalize_title(source["title"])
+            if key and key not in existing_titles:
+                sources.append(source)
+                existing_titles.add(key)
+
+    return sources[:max_results]
+
+
+def normalize_title(title):
+    return re.sub(r"\W+", "", (title or "").lower())
+
+
+def format_reference(source):
+    """Create a readable APA-like reference from available metadata."""
+    authors = source.get("authors") or []
+    year = source.get("year") or "n.d."
+    title = (source.get("title") or "Untitled work").strip()
+    journal = (source.get("journal") or "").strip()
+    doi = (source.get("doi") or "").strip()
+    url = (source.get("url") or "").strip()
+
+    if not authors:
+        author_text = "Author metadata unavailable"
+    elif len(authors) <= 6:
+        author_text = ", ".join(authors)
+    else:
+        author_text = ", ".join(authors[:6]) + ", et al."
+
+    reference = f"{author_text} ({year}). {title}."
+
+    if journal:
+        reference += f" *{journal}*."
+
+    if doi:
+        if doi.startswith("http"):
+            reference += f" {doi}"
+        else:
+            reference += f" https://doi.org/{doi}"
+    elif url:
+        reference += f" {url}"
+
+    return reference
+
+
+# ---------------------------------------------------------
+# DIAGRAM GENERATION
+# ---------------------------------------------------------
+
+def figure_to_png(fig):
+    buffer = io.BytesIO()
+    fig.savefig(
+        buffer,
+        format="png",
+        dpi=180,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def add_box(ax, x, y, width, height, label, fontsize=10):
+    patch = FancyBboxPatch(
+        (x, y),
+        width,
+        height,
+        boxstyle="round,pad=0.03,rounding_size=0.04",
+        linewidth=1.2,
+        edgecolor="#334155",
+        facecolor="#EFF6FF",
+    )
+    ax.add_patch(patch)
+    ax.text(
+        x + width / 2,
+        y + height / 2,
+        label,
+        ha="center",
+        va="center",
+        fontsize=fontsize,
+        wrap=True,
+        color="#172554",
+    )
+
+
+def add_arrow(ax, start, end):
+    arrow = FancyArrowPatch(
+        start,
+        end,
+        arrowstyle="-|>",
+        mutation_scale=14,
+        linewidth=1.3,
+        color="#475569",
+    )
+    ax.add_patch(arrow)
+
+
+def make_workflow_diagram(title):
     fig, ax = plt.subplots(figsize=(10, 2.8))
     ax.set_xlim(0, 10)
-    ax.set_ylim(0, 3)
+    ax.set_ylim(0, 2.3)
     ax.axis("off")
+
+    ax.text(
+        5, 2.05, f"Workflow: {title}",
+        ha="center", va="center", fontsize=13, weight="bold",
+    )
 
     labels = [
-        "Problem\nDefinition",
-        "Requirements /\nData Collection",
-        "Design /\nMethod",
-        "Implementation /\nAnalysis",
-        "Testing /\nEvaluation"
+        "Input",
+        "Processing",
+        "Validation",
+        "Output",
     ]
+    xs = [0.4, 2.85, 5.3, 7.75]
 
-    xs = [1, 3, 5, 7, 9]
+    for x, label in zip(xs, labels):
+        add_box(ax, x, 0.75, 1.65, 0.7, label)
 
-    for i, (x, label) in enumerate(zip(xs, labels)):
-        ax.text(
-            x, 1.5, label,
-            ha="center", va="center", fontsize=9,
-            bbox=dict(boxstyle="round,pad=0.5", fill=False)
-        )
+    for x in [2.1, 4.55, 7.0]:
+        add_arrow(ax, (x, 1.1), (x + 0.55, 1.1))
 
-        if i < len(xs) - 1:
-            ax.annotate(
-                "", xy=(xs[i + 1] - 0.65, 1.5),
-                xytext=(x + 0.65, 1.5),
-                arrowprops=dict(arrowstyle="->", linewidth=1.2)
-            )
-
-    ax.set_title(f"Proposed Workflow: {topic[:70]}", fontsize=11)
-    fig.tight_layout()
-
-    buffer = BytesIO()
-    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    buffer.seek(0)
-    return buffer.getvalue()
+    return figure_to_png(fig)
 
 
-def make_architecture_diagram(topic, project_type):
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, 8)
+def make_architecture_diagram(title):
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.set_xlim(0, 9)
+    ax.set_ylim(0, 4)
     ax.axis("off")
 
-    boxes = [
-        (5, 6.7, "User / Stakeholder"),
-        (5, 5.1, "Input and Presentation Layer"),
-        (5, 3.5, "Core Processing / Business Logic"),
-        (5, 1.9, "Data Storage / External Services")
-    ]
+    ax.text(
+        4.5, 3.65, f"Conceptual System Architecture: {title}",
+        ha="center", va="center", fontsize=12, weight="bold",
+    )
 
-    for x, y, label in boxes:
-        ax.text(
-            x, y, label,
-            ha="center", va="center", fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.65", fill=False)
-        )
+    add_box(ax, 0.5, 2.1, 2.0, 0.8, "User Interface")
+    add_box(ax, 3.5, 2.1, 2.0, 0.8, "Application Logic")
+    add_box(ax, 6.5, 2.1, 2.0, 0.8, "Output / Services")
+    add_arrow(ax, (2.5, 2.5), (3.5, 2.5))
+    add_arrow(ax, (5.5, 2.5), (6.5, 2.5))
 
-    for y1, y2 in [(6.3, 5.5), (4.7, 3.9), (3.1, 2.3)]:
-        ax.annotate(
-            "", xy=(5, y2), xytext=(5, y1),
-            arrowprops=dict(arrowstyle="<->", linewidth=1.2)
-        )
+    add_box(ax, 3.5, 0.65, 2.0, 0.7, "Data / Storage")
+    add_arrow(ax, (4.5, 2.1), (4.5, 1.35))
 
-    ax.set_title(f"Illustrative System Architecture: {topic[:60]}", fontsize=11)
-    fig.tight_layout()
+    ax.text(
+        4.5, 0.25,
+        "Conceptual illustration — adapt to the actual implementation.",
+        ha="center", va="center", fontsize=8, color="#475569",
+    )
 
-    buffer = BytesIO()
-    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    buffer.seek(0)
-    return buffer.getvalue()
+    return figure_to_png(fig)
 
 
-def make_project_plan_chart():
-    """An explicitly illustrative project schedule, not measured results."""
-    tasks = [
-        "Requirements",
-        "Research",
+def make_timeline_diagram(title):
+    phases = [
+        "Planning",
         "Design",
         "Development",
         "Testing",
-        "Documentation"
+        "Documentation",
     ]
-    starts = [0, 1, 2, 3, 5, 5]
-    durations = [1, 2, 1, 2, 1, 2]
+    starts = [0, 1, 2, 3, 4]
+    durations = [1, 1, 2, 1, 1]
 
-    fig, ax = plt.subplots(figsize=(8, 3.8))
-    ax.barh(tasks, durations, left=starts)
-    ax.set_xlabel("Illustrative project week")
-    ax.set_title("Example Project Timeline (Adjust to Your Actual Plan)")
-    ax.invert_yaxis()
+    fig, ax = plt.subplots(figsize=(9, 3.4))
+    ax.barh(phases, durations, left=starts)
+    ax.set_title(f"Illustrative Project Timeline: {title}")
+    ax.set_xlabel("Relative project phase (not actual dates)")
+    ax.set_ylabel("Phase")
     ax.grid(axis="x", alpha=0.25)
+    ax.invert_yaxis()
+
+    fig.text(
+        0.5, 0.01,
+        "Illustrative plan only; replace with the project's real schedule.",
+        ha="center", fontsize=8,
+    )
+    fig.tight_layout(rect=[0, 0.06, 1, 1])
+    return figure_to_png(fig)
+
+
+def make_entity_diagram(title):
+    fig, ax = plt.subplots(figsize=(8, 3.5))
+    ax.set_xlim(0, 8)
+    ax.set_ylim(0, 3.5)
+    ax.axis("off")
+
+    ax.text(
+        4, 3.2, f"Conceptual Data Model: {title}",
+        ha="center", va="center", fontsize=12, weight="bold",
+    )
+
+    add_box(ax, 0.5, 1.3, 2.0, 1.0, "Entity A\nID\nAttributes")
+    add_box(ax, 5.5, 1.3, 2.0, 1.0, "Entity B\nID\nAttributes")
+    add_arrow(ax, (2.5, 1.8), (5.5, 1.8))
+
+    ax.text(
+        4, 2.0, "relationship",
+        ha="center", va="bottom", fontsize=8,
+    )
+    ax.text(
+        4, 0.65,
+        "Generic example — customize entities and relationships for your project.",
+        ha="center", fontsize=8,
+    )
+
+    return figure_to_png(fig)
+
+
+def make_csv_chart(dataframe, x_column, y_column, chart_type, title):
+    """Build a chart using columns from the user's uploaded CSV."""
+    df = dataframe[[x_column, y_column]].dropna().copy()
+
+    if df.empty:
+        raise ValueError("There are no complete rows for the selected columns.")
+
+    if chart_type == "Line":
+        fig, ax = plt.subplots(figsize=(8, 4.2))
+        ax.plot(df[x_column].astype(str), pd.to_numeric(
+            df[y_column], errors="coerce"
+        ), marker="o")
+        ax.set_xlabel(x_column)
+        ax.set_ylabel(y_column)
+        ax.tick_params(axis="x", rotation=35)
+
+    elif chart_type == "Bar":
+        fig, ax = plt.subplots(figsize=(8, 4.2))
+        values = pd.to_numeric(df[y_column], errors="coerce")
+        ax.bar(df[x_column].astype(str), values)
+        ax.set_xlabel(x_column)
+        ax.set_ylabel(y_column)
+        ax.tick_params(axis="x", rotation=35)
+
+    else:
+        fig, ax = plt.subplots(figsize=(8, 4.2))
+        values = pd.to_numeric(df[y_column], errors="coerce")
+        ax.scatter(df[x_column].astype(str), values)
+        ax.set_xlabel(x_column)
+        ax.set_ylabel(y_column)
+        ax.tick_params(axis="x", rotation=35)
+
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
-
-    buffer = BytesIO()
-    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    buffer.seek(0)
-    return buffer.getvalue()
+    return figure_to_png(fig)
 
 
-def build_visuals(topic, project_type):
-    return {
-        "Workflow Diagram": make_workflow_diagram(topic, project_type),
-        "System Architecture Diagram": make_architecture_diagram(
-            topic, project_type
-        ),
-        "Illustrative Project Timeline": make_project_plan_chart()
+# ---------------------------------------------------------
+# GEMINI REPORT GENERATION
+# ---------------------------------------------------------
+
+def build_report_prompt(
+    project_title,
+    project_type,
+    description,
+    audience,
+    selected_chapters,
+    target_pages,
+    formatting_style,
+    content_density,
+    sources,
+    data_description,
+):
+    words_per_page = {
+        "Compact": 420,
+        "Standard": 330,
+        "Detailed": 260,
+    }[formatting_style]
+
+    density_factor = {
+        "Concise": 0.8,
+        "Balanced": 1.0,
+        "Detailed": 1.15,
+    }[content_density]
+
+    estimated_words = int(
+        max(500, target_pages * words_per_page * density_factor)
+    )
+
+    # One model response may not be able to produce very long reports.
+    # Keep the requested budget bounded to reduce truncation risk.
+    requested_words = min(estimated_words, 10000)
+
+    source_text = "\n".join(
+        f"- {format_reference(source)}"
+        for source in sources
+    ) or "- No verified scholarly sources were retrieved."
+
+    chapter_instructions = "\n".join(
+        f"{index}. {chapter}"
+        for index, chapter in enumerate(selected_chapters, start=1)
+    )
+
+    return f"""
+You are an academic project-report writing assistant.
+
+PROJECT DETAILS
+Title: {project_title}
+Project type: {project_type}
+Intended audience: {audience}
+Project description and requirements:
+{description}
+
+REPORT SETTINGS
+Target PDF length: approximately {target_pages} pages.
+Formatting style: {formatting_style}
+Content density: {content_density}
+Approximate content word budget: {requested_words} words.
+Selected chapters:
+{chapter_instructions}
+
+DATA PROVIDED BY USER
+{data_description or "No dataset description supplied."}
+
+POTENTIALLY RELEVANT SOURCES RETRIEVED FROM SCHOLARLY SEARCH
+{source_text}
+
+CRITICAL ACCURACY RULES
+1. Do not invent experiments, participants, measurements, survey responses,
+   numerical findings, performance scores, or evaluation outcomes.
+2. If the user has not supplied results, clearly state that results are
+   pending, proposed, or illustrative rather than claiming they occurred.
+3. Do not invent references, authors, article titles, journals, DOIs, or URLs.
+4. Use the supplied source list only when it genuinely supports a claim.
+   If a source is not relevant, do not cite it.
+5. Do not claim that you accessed or reviewed a full paper when only its
+   metadata is available.
+6. Distinguish planned functionality from implemented functionality.
+7. Do not claim that a system was tested or deployed unless the user supplied
+   evidence that this happened.
+8. Use clear, formal academic language suitable for a student project report.
+9. Avoid repetition, filler, fake quotations, and unsupported statistics.
+10. Explain assumptions and limitations openly.
+
+WRITING INSTRUCTIONS
+- Write a useful, coherent report with substantial content under every
+  selected chapter, proportional to the requested length.
+- Explain concepts, design decisions, procedures, and limitations in detail.
+- Use numbered or bulleted lists where they improve readability.
+- Use Markdown subheadings inside chapters when helpful.
+- Do not create a References chapter. References will be added separately
+  from retrieved metadata.
+- If the project details are insufficient for a factual claim, describe what
+  needs to be confirmed rather than guessing.
+- The target page count is an estimate, not a guarantee. The final PDF may
+  have a different page count because of pagination and diagrams.
+
+OUTPUT FORMAT
+Return only the report chapters, using exactly these markers to start each
+chapter. Do not omit or rename markers:
+
+[[CHAPTER: Chapter Name]]
+
+Write that chapter's content here.
+
+Repeat the marker format for every selected chapter, preserving the chapter
+names and order exactly. Do not add an introduction outside the markers.
+""".strip()
+
+
+def parse_generated_chapters(response_text, selected_chapters):
+    """Parse model output into chapters using explicit chapter markers."""
+    text = (response_text or "").strip()
+    pattern = re.compile(r"\[\[CHAPTER:\s*(.*?)\s*\]\]", re.IGNORECASE)
+    matches = list(pattern.finditer(text))
+
+    chapters = {}
+
+    if matches:
+        for index, match in enumerate(matches):
+            name = match.group(1).strip()
+            start = match.end()
+            end = (
+                matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(text)
+            )
+            content = text[start:end].strip()
+
+            if name and content:
+                chapters[name] = content
+
+    # Match headings case-insensitively to the user-selected chapter names.
+    normalized = {
+        re.sub(r"\s+", " ", name.strip().lower()): content
+        for name, content in chapters.items()
     }
 
+    result = {}
+    for chapter in selected_chapters:
+        key = re.sub(r"\s+", " ", chapter.strip().lower())
+        result[chapter] = normalized.get(key, "")
 
-# ==================================================
-# 6. DOCUMENT FORMATTING
-# ==================================================
+    # If marker parsing failed completely, preserve the response rather than
+    # silently discarding the model's content.
+    if not any(result.values()) and text:
+        first_chapter = selected_chapters[0]
+        result[first_chapter] = text
 
-def clean_paragraph(text):
-    text = text.strip()
-    text = re.sub(r"^\s*#{1,6}\s*", "", text)
-    text = re.sub(r"^\s*[-*]\s+", "• ", text)
-    return text
+    return result
 
 
-def report_as_text(title, chapters, references, include_visuals=True):
-    parts = [
-        title,
-        "=" * len(title),
-        "",
-        "Note: Review this draft, confirm project-specific details, "
-        "and verify citations before submission.",
-        ""
-    ]
+def generate_report(
+    api_key,
+    model_name,
+    project_title,
+    project_type,
+    description,
+    audience,
+    selected_chapters,
+    target_pages,
+    formatting_style,
+    content_density,
+    sources,
+    data_description,
+):
+    client = genai.Client(api_key=api_key)
 
-    for chapter, content in chapters.items():
-        parts.extend([
-            "",
-            chapter.upper(),
-            "-" * len(chapter),
-            content
-        ])
+    prompt = build_report_prompt(
+        project_title=project_title,
+        project_type=project_type,
+        description=description,
+        audience=audience,
+        selected_chapters=selected_chapters,
+        target_pages=target_pages,
+        formatting_style=formatting_style,
+        content_density=content_density,
+        sources=sources,
+        data_description=data_description,
+    )
 
-        if chapter == "System Design" and include_visuals:
-            parts.append(
-                "[Generated workflow and architecture diagrams are included "
-                "in the Word and PDF versions.]"
-            )
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+    )
 
-    if references and "References" not in chapters:
-        parts.extend(["", "REFERENCES", "----------"])
-        parts.extend(references)
+    response_text = getattr(response, "text", None)
+    if not response_text:
+        raise RuntimeError(
+            "The AI returned an empty response. Please try again."
+        )
 
-    return "\n".join(parts)
+    return parse_generated_chapters(response_text, selected_chapters)
+
+
+# ---------------------------------------------------------
+# DOCUMENT EXPORT HELPERS
+# ---------------------------------------------------------
+
+def clean_markdown(text):
+    """Lightweight Markdown cleanup for document exports."""
+    text = re.sub(r"```.*?```", "[Code block omitted in document export]", text,
+                  flags=re.DOTALL)
+    text = re.sub(r"!\[.*?\]\(.*?\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", text)
+    text = re.sub(r"(?m)^\s*[-*]\s+", "• ", text)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"\1", text)
+    return text.strip()
+
+
+def split_markdown_blocks(text):
+    """Yield basic heading, paragraph, and list blocks."""
+    lines = (text or "").splitlines()
+    paragraph_lines = []
+    list_lines = []
+
+    def flush_paragraph():
+        nonlocal paragraph_lines
+        if paragraph_lines:
+            value = " ".join(line.strip() for line in paragraph_lines).strip()
+            if value:
+                yield ("paragraph", value)
+            paragraph_lines = []
+
+    def flush_list():
+        nonlocal list_lines
+        if list_lines:
+            yield ("list", list_lines[:])
+            list_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not stripped:
+            yield from flush_paragraph()
+            yield from flush_list()
+            continue
+
+        heading_match = re.match(r"^(#{1,4})\s+(.+)$", stripped)
+        if heading_match:
+            yield from flush_paragraph()
+            yield from flush_list()
+            yield ("heading", (len(heading_match.group(1)), heading_match.group(2)))
+            continue
+
+        if re.match(r"^[-*]\s+", stripped):
+            yield from flush_paragraph()
+            list_lines.append(re.sub(r"^[-*]\s+", "", stripped))
+            continue
+
+        yield from flush_list()
+        paragraph_lines.append(stripped)
+
+    yield from flush_paragraph()
+    yield from flush_list()
+
+
+def add_chapter_to_word(doc, title, content):
+    doc.add_heading(title, level=1)
+
+    for kind, value in split_markdown_blocks(content):
+        if kind == "heading":
+            level, heading = value
+            doc.add_heading(heading, level=min(level + 1, 4))
+
+        elif kind == "paragraph":
+            paragraph = doc.add_paragraph(clean_markdown(value))
+            paragraph.paragraph_format.space_after = Pt(6)
+
+        elif kind == "list":
+            for item in value:
+                doc.add_paragraph(clean_markdown(item), style="List Bullet")
 
 
 def create_word_report(title, chapters, references, visuals):
     doc = Document()
 
     section = doc.sections[0]
-    section.top_margin = DocxInches(0.75)
-    section.bottom_margin = DocxInches(0.75)
-    section.left_margin = DocxInches(0.85)
-    section.right_margin = DocxInches(0.85)
+    section.top_margin = Inches(0.75)
+    section.bottom_margin = Inches(0.75)
+    section.left_margin = Inches(0.85)
+    section.right_margin = Inches(0.85)
 
-    normal = doc.styles["Normal"]
-    normal.font.name = "Times New Roman"
-    normal.font.size = Pt(12)
+    styles = doc.styles
+    styles["Normal"].font.name = "Arial"
+    styles["Normal"].font.size = Pt(10.5)
+    styles["Normal"].paragraph_format.space_after = Pt(6)
 
-    title_p = doc.add_paragraph()
-    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title_run = title_p.add_run(title)
-    title_run.bold = True
-    title_run.font.size = Pt(22)
+    title_paragraph = doc.add_paragraph()
+    title_paragraph.alignment = 1
+    run = title_paragraph.add_run(title)
+    run.bold = True
+    run.font.size = Pt(24)
 
-    doc.add_paragraph("")
-    note = doc.add_paragraph(
-        "Student project report draft — verify project details and sources."
+    subtitle = doc.add_paragraph()
+    subtitle.alignment = 1
+    subtitle.add_run("Project Report").italic = True
+
+    date_paragraph = doc.add_paragraph()
+    date_paragraph.alignment = 1
+    date_paragraph.add_run(
+        f"Generated on {datetime.now().strftime('%d %B %Y')}"
     )
-    note.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
     doc.add_page_break()
 
-    doc.add_heading("Table of Contents", level=1)
-    for chapter in chapters:
-        doc.add_paragraph(chapter, style="List Number")
+    doc.add_heading("Contents", level=1)
+    for chapter_name in chapters:
+        doc.add_paragraph(chapter_name, style="List Bullet")
+    if visuals:
+        doc.add_paragraph("Figures and diagrams", style="List Bullet")
+    if references:
+        doc.add_paragraph("References", style="List Bullet")
+
     doc.add_page_break()
 
-    for chapter, content in chapters.items():
-        doc.add_heading(chapter, level=1)
+    visual_index = 0
+    for chapter_name, content in chapters.items():
+        if not content.strip():
+            continue
 
-        for raw in content.splitlines():
-            line = clean_paragraph(raw)
-            if not line:
-                continue
+        add_chapter_to_word(doc, chapter_name, content)
 
-            if line.startswith("• "):
-                doc.add_paragraph(line[2:], style="List Bullet")
-            elif (
-                len(line) < 100
-                and line.endswith(":")
-            ):
-                doc.add_heading(line.rstrip(":"), level=2)
-            else:
-                doc.add_paragraph(line)
+        # Insert appropriate conceptual visuals near design/implementation.
+        lower_name = chapter_name.lower()
+        if visuals and (
+            "design" in lower_name
+            or "methodology" in lower_name
+            or "implementation" in lower_name
+        ):
+            for visual in visuals:
+                if visual_index >= len(visuals):
+                    break
+                if visual.get("inserted"):
+                    continue
 
-        if chapter == "Proposed Methodology":
-            doc.add_heading("Proposed Workflow Diagram", level=2)
+                doc.add_paragraph(visual["caption"])
+                doc.add_picture(
+                    io.BytesIO(visual["image"]),
+                    width=Inches(6.0),
+                )
+                visual["inserted"] = True
+                visual_index += 1
+
+    remaining_visuals = [
+        visual for visual in visuals if not visual.get("inserted")
+    ]
+    if remaining_visuals:
+        doc.add_heading("Figures and Diagrams", level=1)
+        for visual in remaining_visuals:
+            doc.add_paragraph(visual["caption"])
             doc.add_picture(
-                BytesIO(visuals["Workflow Diagram"]),
-                width=DocxInches(6.0)
-            )
-            doc.add_paragraph(
-                "Figure 1. Illustrative workflow for the proposed project."
+                io.BytesIO(visual["image"]),
+                width=Inches(6.0),
             )
 
-        if chapter == "System Design":
-            doc.add_heading("Illustrative System Architecture", level=2)
-            doc.add_picture(
-                BytesIO(visuals["System Architecture Diagram"]),
-                width=DocxInches(5.5)
-            )
-            doc.add_paragraph(
-                "Figure 2. Generic architecture; adapt to the actual system."
-            )
-
-        if chapter in ("Implementation", "Testing and Evaluation"):
-            doc.add_heading("Illustrative Project Schedule", level=2)
-            doc.add_picture(
-                BytesIO(visuals["Illustrative Project Timeline"]),
-                width=DocxInches(5.8)
-            )
-            doc.add_paragraph(
-                "Figure 3. Example schedule only; replace with the actual plan."
-            )
-
-    if references and "References" not in chapters:
+    if references:
         doc.add_heading("References", level=1)
-        for ref in references:
-            doc.add_paragraph(ref, style="List Number")
+        for reference in references:
+            doc.add_paragraph(reference)
 
-    buffer = BytesIO()
+    buffer = io.BytesIO()
     doc.save(buffer)
     buffer.seek(0)
+
+    for visual in visuals:
+        visual.pop("inserted", None)
+
     return buffer.getvalue()
 
 
-def add_page_number(canvas, doc):
+def reportlab_image(image_bytes, max_width=6.5 * inch, max_height=4.0 * inch):
+    image = PDFImage(io.BytesIO(image_bytes))
+    ratio = min(
+        max_width / image.imageWidth,
+        max_height / image.imageHeight,
+    )
+    image.drawWidth = image.imageWidth * ratio
+    image.drawHeight = image.imageHeight * ratio
+    return image
+
+
+def add_pdf_page_number(canvas, document, page_counter):
+    page_counter["count"] = canvas.getPageNumber()
     canvas.saveState()
-    canvas.setFont("Times-Roman", 9)
+    canvas.setFont("Helvetica", 8)
+    canvas.setFillColor(colors.grey)
     canvas.drawCentredString(
-        A4[0] / 2, 0.35 * inch, f"Page {doc.page}"
+        A4[0] / 2,
+        0.35 * inch,
+        f"Page {canvas.getPageNumber()}",
     )
     canvas.restoreState()
 
 
 def create_pdf_report(title, chapters, references, visuals):
-    buffer = BytesIO()
+    buffer = io.BytesIO()
+    page_counter = {"count": 0}
 
-    doc = SimpleDocTemplate(
+    document = SimpleDocTemplate(
         buffer,
         pagesize=A4,
         rightMargin=0.7 * inch,
         leftMargin=0.7 * inch,
         topMargin=0.7 * inch,
-        bottomMargin=0.65 * inch
+        bottomMargin=0.65 * inch,
+        title=title,
+        author="AI Project Report Generator",
     )
 
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(
         name="ReportTitle",
         parent=styles["Title"],
-        fontName="Times-Bold",
-        fontSize=22,
-        leading=28,
+        fontName="Helvetica-Bold",
+        fontSize=23,
+        leading=29,
         alignment=TA_CENTER,
-        spaceAfter=24
+        spaceAfter=20,
+    ))
+    styles.add(ParagraphStyle(
+        name="ChapterHeading",
+        parent=styles["Heading1"],
+        fontSize=16,
+        leading=20,
+        spaceBefore=10,
+        spaceAfter=10,
+        keepWithNext=True,
+    ))
+    styles.add(ParagraphStyle(
+        name="SubHeading",
+        parent=styles["Heading2"],
+        fontSize=12,
+        leading=15,
+        spaceBefore=8,
+        spaceAfter=5,
+        keepWithNext=True,
     ))
     styles.add(ParagraphStyle(
         name="ReportBody",
         parent=styles["BodyText"],
-        fontName="Times-Roman",
-        fontSize=10.5,
-        leading=15,
-        spaceAfter=8
+        fontSize=9.5,
+        leading=13.2,
+        spaceAfter=7,
     ))
     styles.add(ParagraphStyle(
-        name="FigureCaption",
+        name="ReferenceBody",
         parent=styles["BodyText"],
-        fontSize=9,
+        fontSize=8.5,
+        leading=11,
+        leftIndent=12,
+        firstLineIndent=-12,
+        spaceAfter=7,
+    ))
+    styles.add(ParagraphStyle(
+        name="SmallCaption",
+        parent=styles["BodyText"],
+        fontSize=8,
+        leading=10,
         alignment=TA_CENTER,
-        spaceAfter=12
+        textColor=colors.darkgrey,
+        spaceAfter=6,
     ))
 
     story = [
-        Spacer(1, 1.4 * inch),
+        Spacer(1, 1.3 * inch),
         Paragraph(escape(title), styles["ReportTitle"]),
-        Spacer(1, 0.2 * inch),
+        Paragraph("Project Report", styles["Heading2"]),
+        Spacer(1, 0.25 * inch),
         Paragraph(
-            "Student project report draft",
-            styles["Heading2"]
-        ),
-        Spacer(1, 0.3 * inch),
-        Paragraph(
-            "Review project-specific details and verify all references "
-            "before submission.",
-            styles["ReportBody"]
+            f"Generated on {datetime.now().strftime('%d %B %Y')}",
+            styles["BodyText"],
         ),
         PageBreak(),
-        Paragraph("Table of Contents", styles["Heading1"])
+        Paragraph("Contents", styles["ChapterHeading"]),
     ]
 
-    for chapter in chapters:
-        story.append(Paragraph(escape(chapter), styles["ReportBody"]))
+    for chapter_name in chapters:
+        story.append(Paragraph(
+            escape(chapter_name), styles["ReportBody"]
+        ))
+    if visuals:
+        story.append(Paragraph("Figures and diagrams", styles["ReportBody"]))
+    if references:
+        story.append(Paragraph("References", styles["ReportBody"]))
 
     story.append(PageBreak())
 
-    for chapter, content in chapters.items():
-        story.append(Paragraph(escape(chapter), styles["Heading1"]))
-        story.append(Spacer(1, 8))
+    for chapter_name, content in chapters.items():
+        if not content.strip():
+            continue
 
-        for raw in content.splitlines():
-            line = clean_paragraph(raw)
-            if not line:
-                continue
+        story.append(Paragraph(
+            escape(chapter_name), styles["ChapterHeading"]
+        ))
 
-            story.append(
-                Paragraph(
-                    escape(line).replace("\n", "<br/>"),
-                    styles["ReportBody"]
+        for kind, value in split_markdown_blocks(content):
+            if kind == "heading":
+                level, heading = value
+                style = (
+                    styles["SubHeading"]
+                    if level <= 2
+                    else styles["Heading3"]
                 )
+                story.append(Paragraph(escape(heading), style))
+
+            elif kind == "paragraph":
+                paragraph = clean_markdown(value)
+                story.append(Paragraph(escape(paragraph), styles["ReportBody"]))
+
+            elif kind == "list":
+                for item in value:
+                    story.append(Paragraph(
+                        "• " + escape(clean_markdown(item)),
+                        styles["ReportBody"],
+                    ))
+
+        lower_name = chapter_name.lower()
+        if visuals and (
+            "design" in lower_name
+            or "methodology" in lower_name
+            or "implementation" in lower_name
+        ):
+            for visual in visuals:
+                if visual.get("inserted"):
+                    continue
+                story.append(Spacer(1, 6))
+                story.append(Paragraph(
+                    escape(visual["caption"]), styles["SmallCaption"]
+                ))
+                story.append(reportlab_image(visual["image"]))
+                story.append(Spacer(1, 10))
+                visual["inserted"] = True
+
+    remaining_visuals = [
+        visual for visual in visuals if not visual.get("inserted")
+    ]
+    if remaining_visuals:
+        story.append(Paragraph(
+            "Figures and Diagrams", styles["ChapterHeading"]
+        ))
+        for visual in remaining_visuals:
+            story.append(Paragraph(
+                escape(visual["caption"]), styles["SmallCaption"]
+            ))
+            story.append(reportlab_image(visual["image"]))
+            story.append(Spacer(1, 10))
+
+    if references:
+        story.append(Paragraph("References", styles["ChapterHeading"]))
+        for reference in references:
+            story.append(Paragraph(
+                escape(reference), styles["ReferenceBody"]
+            ))
+
+    document.build(
+        story,
+        onFirstPage=lambda canvas, doc: add_pdf_page_number(
+            canvas, doc, page_counter
+        ),
+        onLaterPages=lambda canvas, doc: add_pdf_page_number(
+            canvas, doc, page_counter
+        ),
+    )
+
+    pdf_bytes = buffer.getvalue()
+
+    for visual in visuals:
+        visual.pop("inserted", None)
+
+    return pdf_bytes, page_counter["count"]
+
+
+def create_text_report(title, chapters, references):
+    sections = [title, "=" * len(title), ""]
+
+    for chapter_name, content in chapters.items():
+        if content.strip():
+            sections.extend([
+                chapter_name,
+                "-" * len(chapter_name),
+                clean_markdown(content),
+                "",
+            ])
+
+    if references:
+        sections.extend(["References", "----------"])
+        sections.extend(references)
+
+    return "\n".join(sections)
+
+
+# ---------------------------------------------------------
+# SIDEBAR SETTINGS AND INPUT FORM
+# ---------------------------------------------------------
+
+with st.sidebar:
+    st.header("Report settings")
+
+    target_pages = st.slider(
+        "Target PDF pages",
+        min_value=5,
+        max_value=100,
+        value=15,
+        step=5,
+        help=(
+            "This guides the report length. Actual pages depend on the "
+            "generated text, figures, and PDF layout."
+        ),
+    )
+
+    formatting_style = st.selectbox(
+        "Formatting style",
+        STYLE_OPTIONS,
+        index=1,
+    )
+
+    content_density = st.selectbox(
+        "Content density",
+        ["Concise", "Balanced", "Detailed"],
+        index=1,
+    )
+
+    st.divider()
+    st.subheader("Include visuals")
+
+    include_workflow = st.checkbox("Workflow diagram", value=True)
+    include_architecture = st.checkbox(
+        "System architecture diagram", value=True
+    )
+    include_timeline = st.checkbox(
+        "Illustrative project timeline", value=True
+    )
+    include_entity_model = st.checkbox(
+        "Conceptual data model", value=False
+    )
+
+
+st.subheader("1. Project information")
+
+project_title = st.text_input(
+    "Project title",
+    placeholder="e.g. AI-Based Student Performance Prediction",
+)
+
+col1, col2 = st.columns(2)
+
+with col1:
+    project_type = st.selectbox(
+        "Project type",
+        [
+            "Software / Web Application",
+            "Artificial Intelligence / Machine Learning",
+            "Data Science / Analytics",
+            "Research Project",
+            "Mobile Application",
+            "IoT / Embedded System",
+            "Business / Management",
+            "Other",
+        ],
+    )
+
+with col2:
+    audience = st.selectbox(
+        "Report audience",
+        [
+            "College / University",
+            "Technical Review",
+            "Business / Management",
+            "General Audience",
+        ],
+    )
+
+description = st.text_area(
+    "Project description and requirements",
+    placeholder=(
+        "Explain the problem, goals, planned or completed features, "
+        "technologies, methods, and any real findings you have."
+    ),
+    height=170,
+)
+
+st.subheader("2. Choose report chapters")
+
+selected_chapters = st.multiselect(
+    "Select the chapters to generate",
+    options=DEFAULT_CHAPTERS,
+    default=DEFAULT_CHAPTERS,
+)
+
+st.subheader("3. Optional data for charts")
+
+uploaded_csv = st.file_uploader(
+    "Upload a CSV file to create a chart from your data",
+    type=["csv"],
+    help=(
+        "Charts made from this file use its actual rows and selected columns. "
+        "Do not upload sensitive personal information."
+    ),
+)
+
+csv_dataframe = None
+chart_image = None
+chart_caption = ""
+data_description = ""
+
+if uploaded_csv is not None:
+    try:
+        csv_dataframe = pd.read_csv(uploaded_csv)
+
+        if csv_dataframe.empty:
+            st.warning("The uploaded CSV has no data rows.")
+            csv_dataframe = None
+        else:
+            st.write("Preview of your uploaded data:")
+            st.dataframe(csv_dataframe.head(10), use_container_width=True)
+
+            columns = list(csv_dataframe.columns)
+            chart_col1, chart_col2 = st.columns(2)
+
+            with chart_col1:
+                x_column = st.selectbox(
+                    "Chart category / X-axis",
+                    options=columns,
+                    key="chart_x",
+                )
+
+            numeric_columns = [
+                column for column in columns
+                if pd.api.types.is_numeric_dtype(csv_dataframe[column])
+            ]
+
+            with chart_col2:
+                if numeric_columns:
+                    y_column = st.selectbox(
+                        "Numeric Y-axis",
+                        options=numeric_columns,
+                        key="chart_y",
+                    )
+                else:
+                    y_column = None
+                    st.info(
+                        "No numeric columns were detected. Add a numeric "
+                        "column to create a chart."
+                    )
+
+            chart_type = st.selectbox(
+                "Chart type",
+                ["Bar", "Line", "Scatter"],
+                key="chart_type",
             )
 
-        if chapter == "Proposed Methodology":
-            story.append(Spacer(1, 8))
-            story.append(Paragraph(
-                "Proposed Workflow Diagram",
-                styles["Heading2"]
-            ))
-            story.append(PDFImage(
-                BytesIO(visuals["Workflow Diagram"]),
-                width=6.3 * inch,
-                height=1.8 * inch
-            ))
-            story.append(Paragraph(
-                "Figure 1. Illustrative workflow; adapt to the actual project.",
-                styles["FigureCaption"]
-            ))
+            chart_title = st.text_input(
+                "Chart title",
+                value="Chart generated from uploaded data",
+            )
 
-        if chapter == "System Design":
-            story.append(Spacer(1, 8))
-            story.append(Paragraph(
-                "Illustrative System Architecture",
-                styles["Heading2"]
-            ))
-            story.append(PDFImage(
-                BytesIO(visuals["System Architecture Diagram"]),
-                width=5.5 * inch,
-                height=2.8 * inch
-            ))
-            story.append(Paragraph(
-                "Figure 2. Generic architecture; adapt to the actual system.",
-                styles["FigureCaption"]
-            ))
+            if y_column:
+                try:
+                    chart_image = make_csv_chart(
+                        csv_dataframe,
+                        x_column,
+                        y_column,
+                        chart_type,
+                        chart_title,
+                    )
+                    chart_caption = (
+                        f"Figure: {chart_title}. Generated from the user's "
+                        f"uploaded CSV using {x_column} and {y_column}."
+                    )
+                    st.image(chart_image, caption=chart_caption)
+                    data_description = (
+                        f"The user uploaded a CSV with {len(csv_dataframe)} "
+                        f"rows and {len(csv_dataframe.columns)} columns. "
+                        f"The selected chart uses X='{x_column}', "
+                        f"Y='{y_column}', type='{chart_type}'. "
+                        "Do not infer findings that have not been calculated "
+                        "or supported by the data."
+                    )
+                except (ValueError, TypeError) as error:
+                    st.warning(f"Could not create the chart: {error}")
 
-        if chapter in ("Implementation", "Testing and Evaluation"):
-            story.append(Spacer(1, 8))
-            story.append(Paragraph(
-                "Illustrative Project Schedule",
-                styles["Heading2"]
-            ))
-            story.append(PDFImage(
-                BytesIO(visuals["Illustrative Project Timeline"]),
-                width=5.8 * inch,
-                height=2.7 * inch
-            ))
-            story.append(Paragraph(
-                "Figure 3. Example schedule only; replace with the actual plan.",
-                styles["FigureCaption"]
-            ))
-
-        story.append(Spacer(1, 12))
-
-    if references and "References" not in chapters:
-        story.append(Paragraph("References", styles["Heading1"]))
-        for ref in references:
-            story.append(Paragraph(
-                escape(ref), styles["ReportBody"]
-            ))
-
-    doc.build(
-        story,
-        onFirstPage=add_page_number,
-        onLaterPages=add_page_number
-    )
-    buffer.seek(0)
-    return buffer.getvalue()
+    except (ValueError, UnicodeDecodeError, pd.errors.ParserError) as error:
+        st.error(f"Could not read this CSV file: {error}")
+        csv_dataframe = None
 
 
-# ==================================================
-# 7. PROJECT INPUTS
-# ==================================================
+# ---------------------------------------------------------
+# GENERATE REPORT
+# ---------------------------------------------------------
 
-st.subheader("1. Enter your project details")
+st.divider()
 
-with st.form("project_form"):
-    topic = st.text_input(
-        "Project topic",
-        placeholder="e.g. AI-based disease prediction system"
+if target_pages >= 40:
+    st.warning(
+        "Long reports may exceed the AI model's single-response output limit. "
+        "The requested page count is a target, not a guarantee. If the report "
+        "is much shorter than expected, try generating a smaller report first."
     )
 
-    col1, col2 = st.columns(2)
+if st.button("Generate project report", type="primary", use_container_width=True):
+    if not project_title.strip():
+        st.error("Please enter a project title.")
+        st.stop()
 
-    with col1:
-        project_type = st.selectbox(
-            "Project type",
-            [
-                "Research Project",
-                "Software Development",
-                "Engineering Project",
-                "Business Project",
-                "Data Science Project",
-                "Literature Review",
-                "Other"
-            ]
-        )
-
-        academic_level = st.selectbox(
-            "Academic level",
-            [
-                "Diploma",
-                "Undergraduate",
-                "Postgraduate",
-                "Research Scholar",
-                "General"
-            ]
-        )
-
-    with col2:
-        research_count = st.slider(
-            "Number of research sources",
-            3, 10, 5
-        )
-
-        word_count = st.selectbox(
-            "Approximate words per chapter",
-            [200, 300, 500, 700],
-            index=2
-        )
-
-    project_details = st.text_area(
-        "Project details (important for accurate reports)",
-        placeholder=(
-            "Describe the actual system, tools, dataset, modules, "
-            "implementation status, test results, or methodology. "
-            "Leave unknown results blank rather than guessing."
-        ),
-        height=130
-    )
-
-    instructions = st.text_area(
-        "Additional instructions",
-        placeholder=(
-            "College format, required chapters, technologies, "
-            "citation style, or supervisor instructions."
-        )
-    )
-
-    selected_chapters = st.multiselect(
-        "Select report chapters",
-        DEFAULT_CHAPTERS,
-        default=[
-            "Abstract",
-            "Introduction",
-            "Problem Statement",
-            "Objectives",
-            "Literature Review",
-            "Proposed Methodology",
-            "System Design",
-            "Implementation",
-            "Testing and Evaluation",
-            "Results and Discussion",
-            "Conclusion",
-            "References"
-        ]
-    )
-
-    submitted = st.form_submit_button(
-        "🔎 Search Research and Generate Report",
-        type="primary",
-        use_container_width=True
-    )
-
-
-# ==================================================
-# 8. GENERATE REPORT
-# ==================================================
-
-if submitted:
-    if not topic.strip():
-        st.error("Please enter your project topic.")
+    if not description.strip():
+        st.error("Please describe your project so the report can be tailored.")
         st.stop()
 
     if not selected_chapters:
-        st.error("Select at least one chapter.")
+        st.error("Please select at least one chapter.")
         st.stop()
 
-    st.session_state.pop("generated_chapters", None)
-    st.session_state.pop("project_title", None)
-    st.session_state.pop("project_visuals", None)
-    st.session_state.pop("project_references", None)
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        model_name = st.secrets.get(
+            "GEMINI_MODEL",
+            "gemini-2.5-flash",
+        )
+    except Exception:
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-    with st.spinner("Searching academic sources..."):
-        papers, provider = search_research(topic.strip(), research_count)
-        papers = usable_sources(papers)
+    if not api_key:
+        st.error(
+            "Gemini API key not found. Add GEMINI_API_KEY to your "
+            "Streamlit app's Secrets settings."
+        )
+        st.stop()
 
-    if papers:
-        st.success(f"Retrieved {len(papers)} source records from {provider}.")
+    search_query = f"{project_title} {project_type} {description[:250]}"
+
+    with st.status("Preparing your report...", expanded=True) as status:
+        st.write("Searching scholarly source metadata...")
+        sources = search_references(search_query, max_results=8)
+
+        st.write("Generating report chapters with the AI model...")
+        try:
+            chapters = generate_report(
+                api_key=api_key,
+                model_name=model_name,
+                project_title=project_title.strip(),
+                project_type=project_type,
+                description=description.strip(),
+                audience=audience,
+                selected_chapters=selected_chapters,
+                target_pages=target_pages,
+                formatting_style=formatting_style,
+                content_density=content_density,
+                sources=sources,
+                data_description=data_description,
+            )
+        except Exception as error:
+            status.update(label="Report generation failed", state="error")
+            st.error(
+                "The AI could not generate the report. Check your API key, "
+                "model name, quota, and connection, then try again."
+            )
+            st.exception(error)
+            st.stop()
+
+        st.write("Preparing diagrams and charts...")
+        visuals = []
+
+        try:
+            if include_workflow:
+                visuals.append({
+                    "caption": "Workflow diagram — conceptual overview.",
+                    "image": make_workflow_diagram(project_title),
+                })
+
+            if include_architecture:
+                visuals.append({
+                    "caption": (
+                        "System architecture — conceptual illustration; "
+                        "verify and adapt it to the actual system."
+                    ),
+                    "image": make_architecture_diagram(project_title),
+                })
+
+            if include_timeline:
+                visuals.append({
+                    "caption": (
+                        "Illustrative project timeline — not actual dates "
+                        "or evidence of completed work."
+                    ),
+                    "image": make_timeline_diagram(project_title),
+                })
+
+            if include_entity_model:
+                visuals.append({
+                    "caption": (
+                        "Conceptual data model — generic example to customize."
+                    ),
+                    "image": make_entity_diagram(project_title),
+                })
+
+            if chart_image:
+                visuals.append({
+                    "caption": chart_caption,
+                    "image": chart_image,
+                })
+
+        except Exception as error:
+            st.warning(f"One or more visuals could not be generated: {error}")
+
+        references = [format_reference(source) for source in sources]
+
+        st.write("Creating PDF and Word exports...")
+        try:
+            pdf_bytes, actual_pdf_pages = create_pdf_report(
+                project_title.strip(),
+                chapters,
+                references,
+                visuals,
+            )
+
+            word_bytes = create_word_report(
+                project_title.strip(),
+                chapters,
+                references,
+                visuals,
+            )
+
+            text_report = create_text_report(
+                project_title.strip(),
+                chapters,
+                references,
+            )
+
+        except Exception as error:
+            status.update(label="Export creation failed", state="error")
+            st.error("The report was generated, but an export failed.")
+            st.exception(error)
+            st.stop()
+
+        status.update(label="Report ready", state="complete")
+
+    st.session_state["generated_report"] = {
+        "title": project_title.strip(),
+        "chapters": chapters,
+        "references": references,
+        "pdf": pdf_bytes,
+        "pdf_pages": actual_pdf_pages,
+        "word": word_bytes,
+        "text": text_report,
+        "target_pages": target_pages,
+    }
+
+
+# ---------------------------------------------------------
+# DISPLAY AND DOWNLOAD GENERATED REPORT
+# ---------------------------------------------------------
+
+report = st.session_state.get("generated_report")
+
+if report:
+    st.divider()
+    st.subheader("4. Your report is ready")
+
+    actual_pages = report["pdf_pages"]
+    target = report["target_pages"]
+
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric("Target PDF pages", target)
+    metric2.metric("Actual PDF pages", actual_pages)
+    metric3.metric(
+        "Difference",
+        f"{actual_pages - target:+d} pages",
+    )
+
+    if actual_pages == target:
+        st.success("The PDF matches your target page count.")
+    elif abs(actual_pages - target) <= 2:
+        st.info(
+            "The PDF is close to your target. Page counts can vary with "
+            "font rendering, figures, and paragraph layout."
+        )
     else:
         st.warning(
-            "No research sources could be retrieved. You can still generate "
-            "a report, but its literature review and references will be limited."
+            "The PDF differs from your target. Try changing the content "
+            "density or target page count and generating again. A target "
+            "page count cannot be guaranteed by the AI model."
         )
 
-    with st.expander("Review retrieved academic sources"):
-        if not papers:
-            st.write("No source records available.")
-        for index, paper in enumerate(papers, start=1):
-            st.markdown(f"**{index}. {paper['title']}**")
-            st.write(f"Authors: {format_authors(paper.get('authors', []))}")
-            st.write(f"Year: {paper.get('year', 'Unknown')}")
-            if paper.get("url"):
-                st.write(paper["url"])
+    st.write("Download your generated files:")
 
-    source_context = build_source_context(papers)
-    progress = st.progress(0)
-    status = st.empty()
+    col_pdf, col_word, col_text = st.columns(3)
 
-    try:
-        status.info("Generating report chapters with Gemini...")
-        report_text = generate_report(
-            topic=topic.strip(),
-            project_type=project_type,
-            academic_level=academic_level,
-            word_count=word_count,
-            instructions=instructions,
-            chapters=selected_chapters,
-            source_context=source_context,
-            project_details=project_details
-        )
-        progress.progress(0.7)
+    safe_name = re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "_",
+        report["title"],
+    ).strip("_") or "project_report"
 
-        chapters = split_chapters(report_text, selected_chapters)
-
-        status.info("Creating diagrams and charts...")
-        visuals = build_visuals(topic.strip(), project_type)
-        references = [format_reference(p) for p in papers]
-        progress.progress(1.0)
-
-        st.session_state["generated_chapters"] = chapters
-        st.session_state["project_title"] = topic.strip()
-        st.session_state["project_visuals"] = visuals
-        st.session_state["project_references"] = references
-
-        status.empty()
-        st.success("Report generated. Review it before downloading.")
-
-    except Exception as exc:
-        progress.empty()
-        status.empty()
-        message = str(exc)
-        st.error("The report could not be generated.")
-
-        if "429" in message or "RESOURCE_EXHAUSTED" in message:
-            st.warning(
-                "Gemini quota or rate limit reached. Wait for the quota "
-                "to reset, or check Google AI Studio usage and limits."
-            )
-        elif "503" in message or "UNAVAILABLE" in message.upper():
-            st.warning(
-                "Gemini is temporarily overloaded. Wait a few minutes "
-                "and try again."
-            )
-        elif "403" in message or "PERMISSION_DENIED" in message:
-            st.warning("Check API access and Google Cloud API settings.")
-        elif "404" in message or "NOT_FOUND" in message:
-            st.warning(
-                "The configured Gemini model may not be available to your "
-                "account. Check GEMINI_MODEL in Streamlit Secrets."
-            )
-        else:
-            st.warning("Check the API key, model configuration, and error below.")
-
-        with st.expander("Technical error details"):
-            st.code(message[:4000])
-
-
-# ==================================================
-# 9. PREVIEW AND DOWNLOAD
-# ==================================================
-
-if st.session_state.get("generated_chapters"):
-    chapters = st.session_state["generated_chapters"]
-    title = st.session_state.get("project_title", "Project Report")
-    visuals = st.session_state.get("project_visuals", {})
-    references = st.session_state.get("project_references", [])
-
-    st.divider()
-    st.subheader("2. Report preview")
-
-    for index, (chapter, content) in enumerate(chapters.items()):
-        with st.expander(chapter, expanded=False):
-            st.markdown(content)
-            st.download_button(
-                f"Download {chapter} (.txt)",
-                data=content,
-                file_name=(
-                    re.sub(r"[^a-zA-Z0-9_-]+", "_", chapter).strip("_")
-                    or "chapter"
-                ) + ".txt",
-                mime="text/plain",
-                key=f"chapter_download_{index}"
-            )
-
-    st.subheader("3. Generated visuals")
-    for name, image_bytes in visuals.items():
-        with st.expander(name):
-            st.image(image_bytes, caption=name, use_container_width=True)
-
-    st.divider()
-    st.subheader("4. Download complete report")
-
-    full_text = report_as_text(title, chapters, references)
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
+    with col_pdf:
         st.download_button(
-            "📄 Download TXT",
-            data=full_text,
-            file_name="project_report.txt",
-            mime="text/plain",
-            use_container_width=True
+            "📄 Download PDF",
+            data=report["pdf"],
+            file_name=f"{safe_name}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
         )
 
-    with col2:
-        try:
-            word_file = create_word_report(
-                title, chapters, references, visuals
-            )
-            st.download_button(
-                "📝 Download Word",
-                data=word_file,
-                file_name="project_report.docx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "wordprocessingml.document"
-                ),
-                use_container_width=True
-            )
-        except Exception as exc:
-            st.error(f"Word export failed: {exc}")
+    with col_word:
+        st.download_button(
+            "📝 Download Word",
+            data=report["word"],
+            file_name=f"{safe_name}.docx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            use_container_width=True,
+        )
 
-    with col3:
-        try:
-            pdf_file = create_pdf_report(
-                title, chapters, references, visuals
-            )
-            st.download_button(
-                "📕 Download PDF",
-                data=pdf_file,
-                file_name="project_report.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-        except Exception as exc:
-            st.error(f"PDF export failed: {exc}")
+    with col_text:
+        st.download_button(
+            "📃 Download TXT",
+            data=report["text"],
+            file_name=f"{safe_name}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
 
-    st.caption(
-        "The diagrams and timeline are illustrative templates, not proof of "
-        "completed implementation or measured results. Verify sources, replace "
-        "generic diagrams with your actual design, and follow your institution's "
-        "reporting and AI-use requirements."
-    )
+    with st.expander("Preview generated chapters"):
+        for chapter_name, content in report["chapters"].items():
+            if content.strip():
+                st.markdown(f"### {chapter_name}")
+                st.markdown(content)
+
+    with st.expander("Review retrieved references"):
+        if report["references"]:
+            for index, reference in enumerate(report["references"], start=1):
+                st.write(f"{index}. {reference}")
+        else:
+            st.info(
+                "No scholarly references were retrieved. Search for relevant "
+                "sources separately and verify bibliographic details before "
+                "submitting your report."
+            )
+
+st.caption(
+    "Always verify citations, technical details, diagrams, and claims before "
+    "submitting a report. Conceptual illustrations are not evidence of actual "
+    "implementation or experimental results."
+)
