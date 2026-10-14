@@ -1,26 +1,26 @@
-
 import os
 import re
 import time
 import html
+from io import BytesIO
+from xml.sax.saxutils import escape
+
 import requests
 import streamlit as st
 from google import genai
 from docx import Document
-from io import BytesIO
-from xml.sax.saxutils import escape
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, PageBreak
+    SimpleDocTemplate, Paragraph, Spacer
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.units import inch
 
 
-# --------------------------------------------------
-# PAGE CONFIGURATION
-# --------------------------------------------------
+# ==================================================
+# 1. PAGE CONFIGURATION
+# ==================================================
 
 st.set_page_config(
     page_title="AI Project Report Generator",
@@ -31,13 +31,13 @@ st.set_page_config(
 st.title("📚 AI Project Report Generator")
 st.write(
     "Search academic research, generate project report chapters "
-    "using Gemini, and export your report as TXT, Word, or PDF."
+    "with Gemini, and download your report in TXT, Word, or PDF format."
 )
 
 
-# --------------------------------------------------
-# CONFIGURATION AND SECRETS
-# --------------------------------------------------
+# ==================================================
+# 2. CONFIGURATION
+# ==================================================
 
 def get_setting(name, default=""):
     try:
@@ -48,12 +48,12 @@ def get_setting(name, default=""):
 
 
 GEMINI_API_KEY = get_setting("GEMINI_API_KEY")
-GEMINI_MODEL = get_setting("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = get_setting("GEMINI_MODEL", "gemini-3.8-flash")
 
 if not GEMINI_API_KEY:
     st.error(
-        "Gemini API key is missing. Open your Streamlit app settings, "
-        "go to Secrets, and add GEMINI_API_KEY."
+        "Gemini API key not found. Add GEMINI_API_KEY in "
+        "Streamlit Settings → Secrets."
     )
     st.stop()
 
@@ -64,17 +64,16 @@ except Exception as exc:
     st.stop()
 
 
-# --------------------------------------------------
-# RESEARCH SEARCH
-# --------------------------------------------------
+# ==================================================
+# 3. ACADEMIC RESEARCH SEARCH
+# ==================================================
 
 HEADERS = {
     "User-Agent": "AIProjectReportGenerator/1.0"
 }
 
 
-def decode_openalex_abstract(inverted_index):
-    """Convert OpenAlex's inverted abstract index into readable text."""
+def decode_abstract(inverted_index):
     if not inverted_index:
         return ""
 
@@ -89,7 +88,7 @@ def decode_openalex_abstract(inverted_index):
     )
 
 
-def search_openalex(topic, limit=6):
+def search_openalex(topic, limit):
     url = "https://api.openalex.org/works"
 
     params = {
@@ -115,11 +114,10 @@ def search_openalex(topic, limit=6):
                 continue
 
             response.raise_for_status()
-            payload = response.json()
-
+            data = response.json()
             results = []
 
-            for item in payload.get("results", []):
+            for item in data.get("results", []):
                 authors = []
 
                 for authorship in item.get("authorships", [])[:5]:
@@ -137,13 +135,9 @@ def search_openalex(topic, limit=6):
                     "year": item.get("publication_year") or "Unknown",
                     "authors": ", ".join(authors) or "Authors not listed",
                     "doi": item.get("doi") or "",
-                    "url": (
-                        item.get("doi")
-                        or item.get("id")
-                        or ""
-                    ),
+                    "url": item.get("doi") or item.get("id") or "",
                     "journal": source.get("display_name", ""),
-                    "abstract": decode_openalex_abstract(
+                    "abstract": decode_abstract(
                         item.get("abstract_inverted_index")
                     )
                 })
@@ -157,19 +151,13 @@ def search_openalex(topic, limit=6):
     return []
 
 
-def search_crossref(topic, limit=6):
-    """Fallback source if OpenAlex is temporarily unavailable."""
+def search_crossref(topic, limit):
     url = "https://api.crossref.org/works"
-
-    params = {
-        "query": topic,
-        "rows": limit
-    }
 
     try:
         response = requests.get(
             url,
-            params=params,
+            params={"query": topic, "rows": limit},
             headers=HEADERS,
             timeout=25
         )
@@ -179,19 +167,21 @@ def search_crossref(topic, limit=6):
         results = []
 
         for item in items:
-            title_list = item.get("title") or []
-            title = title_list[0] if title_list else "Untitled"
+            titles = item.get("title") or []
+            title = titles[0] if titles else "Untitled"
 
-            author_names = []
+            authors = []
+
             for author in item.get("author", [])[:5]:
                 name = " ".join(
-                    part for part in [
+                    part for part in (
                         author.get("given", ""),
                         author.get("family", "")
-                    ] if part
+                    ) if part
                 )
+
                 if name:
-                    author_names.append(name)
+                    authors.append(name)
 
             date_parts = (
                 item.get("published", {}).get("date-parts")
@@ -214,7 +204,7 @@ def search_crossref(topic, limit=6):
             results.append({
                 "title": title,
                 "year": year,
-                "authors": ", ".join(author_names) or "Authors not listed",
+                "authors": ", ".join(authors) or "Authors not listed",
                 "doi": doi,
                 "url": (
                     f"https://doi.org/{doi}"
@@ -233,22 +223,22 @@ def search_crossref(topic, limit=6):
 
 
 def search_research(topic, limit):
-    results = search_openalex(topic, limit)
+    papers = search_openalex(topic, limit)
 
-    if results:
-        return results, "OpenAlex"
+    if papers:
+        return papers, "OpenAlex"
 
-    results = search_crossref(topic, limit)
+    papers = search_crossref(topic, limit)
 
-    if results:
-        return results, "Crossref"
+    if papers:
+        return papers, "Crossref"
 
     return [], None
 
 
-# --------------------------------------------------
-# REPORT CHAPTERS
-# --------------------------------------------------
+# ==================================================
+# 4. REPORT CHAPTERS
+# ==================================================
 
 DEFAULT_CHAPTERS = [
     "Abstract",
@@ -259,159 +249,178 @@ DEFAULT_CHAPTERS = [
     "Scope of the Project",
     "Proposed Methodology",
     "System Design",
+    "Implementation",
+    "Testing and Evaluation",
     "Expected Outcomes",
     "Conclusion",
     "References"
 ]
 
 
-def make_source_context(papers):
+def build_source_context(papers):
     sections = []
 
     for index, paper in enumerate(papers, start=1):
-        abstract = paper.get("abstract") or "No abstract available."
-        abstract = abstract[:1800]
-
         sections.append(
-            f"Source {index}\n"
+            f"SOURCE {index}\n"
             f"Title: {paper['title']}\n"
             f"Authors: {paper['authors']}\n"
             f"Year: {paper['year']}\n"
             f"Journal: {paper.get('journal', '')}\n"
             f"DOI or URL: {paper.get('url', '')}\n"
-            f"Abstract: {abstract}\n"
+            f"Abstract: {(paper.get('abstract') or 'Not available')[:1200]}\n"
         )
 
     return "\n".join(sections)
 
 
-def generate_chapter(
-    chapter,
+def generate_all_chapters(
     topic,
     project_type,
     academic_level,
     word_count,
     instructions,
+    selected_chapters,
     source_context
 ):
+    chapter_list = "\n".join(
+        f"- {chapter}" for chapter in selected_chapters
+    )
+
     prompt = f"""
-You are an academic project-report writing assistant.
+You are an experienced academic project-report writing assistant.
 
-Write the report chapter: {chapter}
+Write a project report about the following topic.
 
-PROJECT DETAILS
-Project topic: {topic}
-Project type: {project_type}
-Academic level: {academic_level}
-Approximate target length: {word_count} words per chapter
+PROJECT TOPIC:
+{topic}
 
-ADDITIONAL USER INSTRUCTIONS
-{instructions or "None provided."}
+PROJECT TYPE:
+{project_type}
 
-RESEARCH SOURCES
+ACADEMIC LEVEL:
+{academic_level}
+
+TARGET LENGTH:
+Approximately {word_count} words per chapter. Be concise if needed
+to keep the entire report within a reasonable response length.
+
+ADDITIONAL INSTRUCTIONS:
+{instructions or "None supplied."}
+
+CHAPTERS REQUIRED, IN THIS EXACT ORDER:
+{chapter_list}
+
+ACADEMIC SOURCES:
 {source_context}
 
-WRITING REQUIREMENTS
-1. Write clear, formal academic English.
-2. Keep the discussion relevant to the specified project topic.
-3. Use meaningful headings and subheadings where appropriate.
-4. Explain technical concepts clearly and logically.
-5. Use the research information when relevant.
-6. Never invent authors, publications, statistics, experiments, or findings.
-7. Distinguish established evidence from proposed ideas and expectations.
-8. If information is unavailable, acknowledge the limitation.
-9. Do not claim that an experiment or implementation was completed unless
-   the user supplied evidence that it was completed.
-10. Do not fabricate citations. Use only the supplied source details.
-11. For the References chapter, list only supplied research sources.
-12. Output the chapter content itself, without discussing these instructions.
+IMPORTANT REQUIREMENTS:
+1. Write every requested chapter.
+2. Separate each chapter using this exact format, with the chapter name
+   matching the requested name:
 
-Generate the chapter now.
+<<<CHAPTER: Abstract>>>
+
+Chapter text here.
+
+<<<CHAPTER: Introduction>>>
+
+Chapter text here.
+
+Continue using the exact marker format for every requested chapter.
+
+3. Use clear, formal academic English and useful subheadings.
+4. Do not fabricate research, citations, authors, statistics, results,
+   or experiments.
+5. Explain the proposed approach as a proposal if implementation details
+   have not been supplied.
+6. Use the supplied academic sources when relevant.
+7. For References, list only the supplied sources. Include their DOI or
+   URL where available. Do not invent missing publication details.
+8. If a source has no abstract, do not invent what its study concluded.
+9. Keep each chapter relevant and avoid repeating the same paragraphs.
+10. Return the report only, using the chapter markers exactly as specified.
 """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt
-    )
+    last_error = None
 
-    text = response.text
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt
+            )
 
-    if not text or not text.strip():
-        raise ValueError("Gemini returned an empty response.")
+            text = response.text
 
-    return text.strip()
+            if not text or not text.strip():
+                raise ValueError("Gemini returned an empty response.")
 
+            return text.strip()
 
-# --------------------------------------------------
-# EXPORT FUNCTIONS
-# --------------------------------------------------
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
 
-def create_word_report(title, chapters):
-    document = Document()
-    document.add_heading(title, 0)
+            # Retry temporary overloads only.
+            if (
+                ("503" in message or "unavailable" in message)
+                and attempt < 2
+            ):
+                time.sleep(5 * (attempt + 1))
+                continue
 
-    for chapter, content in chapters.items():
-        document.add_heading(chapter, level=1)
+            # Do not repeatedly retry exhausted quota or invalid settings.
+            raise exc
 
-        for paragraph in content.split("\n"):
-            paragraph = paragraph.strip()
-
-            if paragraph:
-                document.add_paragraph(paragraph)
-
-    buffer = BytesIO()
-    document.save(buffer)
-    buffer.seek(0)
-    return buffer.getvalue()
+    raise last_error
 
 
-def create_pdf_report(title, chapters):
-    buffer = BytesIO()
+def split_chapters(report_text, selected_chapters):
+    pattern = r"<<<CHAPTER:\s*(.*?)\s*>>>"
+    matches = list(re.finditer(pattern, report_text, flags=re.IGNORECASE))
 
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=0.75 * inch,
-        leftMargin=0.75 * inch,
-        topMargin=0.75 * inch,
-        bottomMargin=0.75 * inch
-    )
+    results = {}
 
-    styles = getSampleStyleSheet()
+    if not matches:
+        return {
+            "Complete Report": report_text.strip()
+        }
 
-    title_style = ParagraphStyle(
-        "ReportTitle",
-        parent=styles["Title"],
-        alignment=TA_CENTER,
-        spaceAfter=24
-    )
+    for index, match in enumerate(matches):
+        name = match.group(1).strip()
 
-    story = [Paragraph(escape(title), title_style), Spacer(1, 12)]
-
-    for chapter, content in chapters.items():
-        story.append(
-            Paragraph(escape(chapter), styles["Heading1"])
+        start = match.end()
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(report_text)
         )
-        story.append(Spacer(1, 8))
 
-        for paragraph in content.split("\n"):
-            paragraph = paragraph.strip()
+        content = report_text[start:end].strip()
 
-            if paragraph:
-                story.append(
-                    Paragraph(
-                        escape(paragraph).replace("\n", "<br/>"),
-                        styles["BodyText"]
-                    )
-                )
-                story.append(Spacer(1, 7))
+        # Match requested chapter names without regard to case.
+        requested_name = next(
+            (
+                chapter for chapter in selected_chapters
+                if chapter.lower() == name.lower()
+            ),
+            name
+        )
 
-        story.append(Spacer(1, 12))
+        if content:
+            results[requested_name] = content
 
-    doc.build(story)
-    buffer.seek(0)
-    return buffer.getvalue()
+    # Preserve any report content even if the model used unexpected markers.
+    if not results:
+        return {"Complete Report": report_text.strip()}
 
+    return results
+
+
+# ==================================================
+# 5. EXPORT FUNCTIONS
+# ==================================================
 
 def report_as_text(title, chapters):
     parts = [title, "=" * len(title)]
@@ -427,11 +436,83 @@ def report_as_text(title, chapters):
     return "\n".join(parts)
 
 
-# --------------------------------------------------
-# USER INTERFACE
-# --------------------------------------------------
+def create_word_report(title, chapters):
+    document = Document()
+    document.add_heading(title, 0)
 
-st.subheader("1. Project details")
+    for chapter, content in chapters.items():
+        document.add_heading(chapter, level=1)
+
+        for paragraph in content.splitlines():
+            paragraph = paragraph.strip()
+
+            if paragraph:
+                document.add_paragraph(paragraph)
+
+    buffer = BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+
+    return buffer.getvalue()
+
+
+def create_pdf_report(title, chapters):
+    buffer = BytesIO()
+
+    document = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=0.7 * inch,
+        leftMargin=0.7 * inch,
+        topMargin=0.7 * inch,
+        bottomMargin=0.7 * inch
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "CustomTitle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        spaceAfter=24
+    )
+
+    story = [
+        Paragraph(escape(title), title_style),
+        Spacer(1, 12)
+    ]
+
+    for chapter, content in chapters.items():
+        story.append(
+            Paragraph(escape(chapter), styles["Heading1"])
+        )
+        story.append(Spacer(1, 8))
+
+        for paragraph in content.splitlines():
+            paragraph = paragraph.strip()
+
+            if paragraph:
+                story.append(
+                    Paragraph(
+                        escape(paragraph),
+                        styles["BodyText"]
+                    )
+                )
+                story.append(Spacer(1, 7))
+
+        story.append(Spacer(1, 12))
+
+    document.build(story)
+    buffer.seek(0)
+
+    return buffer.getvalue()
+
+
+# ==================================================
+# 6. PROJECT INPUT FORM
+# ==================================================
+
+st.subheader("1. Enter your project details")
 
 with st.form("project_form"):
     topic = st.text_input(
@@ -471,25 +552,25 @@ with st.form("project_form"):
             "Number of research sources",
             min_value=3,
             max_value=10,
-            value=6
+            value=5
         )
 
         word_count = st.selectbox(
             "Approximate words per chapter",
-            [300, 500, 700, 1000],
-            index=1
+            [200, 300, 500, 700],
+            index=2
         )
 
     instructions = st.text_area(
         "Additional instructions (optional)",
         placeholder=(
-            "Mention your required format, technology, "
-            "case study, or college guidelines."
+            "Mention required technologies, project requirements, "
+            "college guidelines, or formatting instructions."
         )
     )
 
     selected_chapters = st.multiselect(
-        "Choose report chapters",
+        "Select report chapters",
         DEFAULT_CHAPTERS,
         default=[
             "Abstract",
@@ -510,41 +591,40 @@ with st.form("project_form"):
     )
 
 
-# --------------------------------------------------
-# GENERATION WORKFLOW
-# --------------------------------------------------
+# ==================================================
+# 7. GENERATE REPORT WITH ONE API REQUEST
+# ==================================================
 
 if submitted:
     if not topic.strip():
-        st.error("Please enter your project topic.")
+        st.error("Please enter a project topic.")
         st.stop()
 
     if not selected_chapters:
-        st.error("Please select at least one report chapter.")
+        st.error("Please select at least one chapter.")
         st.stop()
 
     st.session_state.pop("generated_chapters", None)
     st.session_state.pop("project_title", None)
 
     with st.spinner("Searching academic research..."):
-        papers, research_provider = search_research(
+        papers, provider = search_research(
             topic.strip(),
             research_count
         )
 
     if not papers:
         st.warning(
-            "The research services could not be reached right now. "
-            "Check your internet connection and try again. "
-            "You can retry shortly."
+            "Could not retrieve research sources right now. "
+            "Check your connection and try again."
         )
         st.stop()
 
     st.success(
-        f"Found {len(papers)} research records using {research_provider}."
+        f"Found {len(papers)} research records using {provider}."
     )
 
-    with st.expander("View research sources", expanded=True):
+    with st.expander("View research sources"):
         for index, paper in enumerate(papers, start=1):
             st.markdown(f"**{index}. {paper['title']}**")
             st.write(
@@ -555,106 +635,122 @@ if submitted:
                 st.write(f"Source: {paper['url']}")
 
             if paper.get("abstract"):
-                st.caption(paper["abstract"][:600])
+                st.caption(paper["abstract"][:500])
 
-    source_context = make_source_context(papers)
-
-    generated_chapters = {}
-    errors = []
+    source_context = build_source_context(papers)
 
     progress = st.progress(0)
     status = st.empty()
 
-    for index, chapter in enumerate(selected_chapters):
-        status.info(
-            f"Generating chapter {index + 1} of "
-            f"{len(selected_chapters)}: {chapter}"
+    status.info(
+        f"Generating {len(selected_chapters)} chapters in one Gemini request. "
+        "This may take a little while."
+    )
+
+    try:
+        report_text = generate_all_chapters(
+            topic=topic.strip(),
+            project_type=project_type,
+            academic_level=academic_level,
+            word_count=word_count,
+            instructions=instructions,
+            selected_chapters=selected_chapters,
+            source_context=source_context
         )
 
-        try:
-            content = generate_chapter(
-                chapter=chapter,
-                topic=topic.strip(),
-                project_type=project_type,
-                academic_level=academic_level,
-                word_count=word_count,
-                instructions=instructions,
-                source_context=source_context
-            )
+        chapters = split_chapters(
+            report_text,
+            selected_chapters
+        )
 
-            generated_chapters[chapter] = content
-
-        except Exception as exc:
-            error_text = str(exc)
-            errors.append((chapter, error_text))
-
-            if (
-                "429" in error_text
-                or "RESOURCE_EXHAUSTED" in error_text.upper()
-                or "quota" in error_text.lower()
-            ):
-                st.warning(
-                    "Gemini may have reached its free-tier quota or "
-                    "rate limit. Check your Google AI Studio usage "
-                    "limits before retrying."
-                )
-                break
-
-        progress.progress((index + 1) / len(selected_chapters))
-
-    progress.progress(1.0)
-    status.empty()
-
-    if generated_chapters:
-        st.session_state["generated_chapters"] = generated_chapters
+        st.session_state["generated_chapters"] = chapters
         st.session_state["project_title"] = topic.strip()
 
-        st.success(
-            f"Generated {len(generated_chapters)} chapter(s) successfully."
-        )
+        progress.progress(1.0)
+        status.empty()
 
-    if errors:
-        with st.expander("Chapters that could not be generated"):
-            for chapter, error in errors:
-                st.write(f"**{chapter}:** {error[:700]}")
+        if len(chapters) == 1 and "Complete Report" in chapters:
+            st.warning(
+                "Gemini returned the report without the expected chapter "
+                "markers. The complete response is preserved below."
+            )
+        else:
+            st.success(
+                f"Report generated successfully: {len(chapters)} section(s)."
+            )
 
-    if not generated_chapters:
-        st.error(
-            "No chapters were generated. Check the error details above, "
-            "your Gemini API key, model name, and available quota."
-        )
+    except Exception as exc:
+        progress.empty()
+        status.empty()
+
+        message = str(exc)
+
+        st.error("Gemini could not generate the report.")
+
+        if "429" in message or "RESOURCE_EXHAUSTED" in message:
+            st.warning(
+                "The Gemini API quota or rate limit has been reached. "
+                "Wait until the quota resets, or check your usage and "
+                "limits in Google AI Studio."
+            )
+        elif "503" in message or "UNAVAILABLE" in message.upper():
+            st.warning(
+                "Gemini is temporarily overloaded. Please wait a few "
+                "minutes and try again."
+            )
+        elif "403" in message or "PERMISSION_DENIED" in message:
+            st.warning(
+                "The API may be disabled for your Google Cloud project, "
+                "or your key may not have permission to use it."
+            )
+        elif "404" in message or "NOT_FOUND" in message:
+            st.warning(
+                "The configured Gemini model is unavailable. Check "
+                "GEMINI_MODEL in Streamlit Secrets and use a model "
+                "available to your account."
+            )
+        else:
+            st.warning(
+                "Check your API key, model configuration, and the "
+                "detailed error below."
+            )
+
+        with st.expander("Technical error details"):
+            st.code(message[:4000])
 
 
-# --------------------------------------------------
-# DISPLAY AND DOWNLOAD GENERATED REPORT
-# --------------------------------------------------
+# ==================================================
+# 8. DISPLAY AND DOWNLOAD REPORT
+# ==================================================
 
 if st.session_state.get("generated_chapters"):
     chapters = st.session_state["generated_chapters"]
-    report_title = st.session_state.get(
+    title = st.session_state.get(
         "project_title",
         "Project Report"
     )
 
     st.divider()
-    st.subheader("2. Your generated report")
+    st.subheader("2. Generated project report")
 
-    for chapter, content in chapters.items():
+    for index, (chapter, content) in enumerate(chapters.items()):
         with st.expander(chapter, expanded=False):
             st.markdown(content)
+
+            filename = (
+                re.sub(r"[^a-zA-Z0-9_-]+", "_", chapter).strip("_")
+                or "chapter"
+            )
 
             st.download_button(
                 label=f"Download {chapter} (.txt)",
                 data=content,
-                file_name=(
-                    re.sub(r"[^a-zA-Z0-9_-]+", "_", chapter).strip("_")
-                    or "chapter"
-                ) + ".txt",
+                file_name=f"{filename}.txt",
                 mime="text/plain",
-                key=f"download_{chapter}"
+                key=f"chapter_download_{index}"
             )
 
-    full_text = report_as_text(report_title, chapters)
+    full_text = report_as_text(title, chapters)
 
     st.divider()
     st.subheader("3. Download your complete report")
@@ -672,11 +768,11 @@ if st.session_state.get("generated_chapters"):
 
     with col2:
         try:
-            word_bytes = create_word_report(report_title, chapters)
+            word_file = create_word_report(title, chapters)
 
             st.download_button(
                 "📝 Download Word",
-                data=word_bytes,
+                data=word_file,
                 file_name="project_report.docx",
                 mime=(
                     "application/vnd.openxmlformats-officedocument."
@@ -689,11 +785,11 @@ if st.session_state.get("generated_chapters"):
 
     with col3:
         try:
-            pdf_bytes = create_pdf_report(report_title, chapters)
+            pdf_file = create_pdf_report(title, chapters)
 
             st.download_button(
                 "📕 Download PDF",
-                data=pdf_bytes,
+                data=pdf_file,
                 file_name="project_report.pdf",
                 mime="application/pdf",
                 use_container_width=True
@@ -702,6 +798,7 @@ if st.session_state.get("generated_chapters"):
             st.error(f"PDF export failed: {exc}")
 
     st.caption(
-        "Review the generated report, verify the cited research, "
-        "and adapt the content to your institution's requirements."
+        "Review the content and verify the original sources before "
+        "submitting your report. AI-generated references and claims "
+        "should be checked against the original publications."
     )
