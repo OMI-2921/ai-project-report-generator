@@ -238,11 +238,31 @@ if st.button("🔎 Search Research Sources", type="secondary"):
             else:
                 st.info("No publications found. Try a broader topic.")
 
-        except requests.RequestException:
+      
+        except requests.RequestException as error:
             st.error(
-                "The research service could not be reached. "
-                "Please try again."
+                f"Research request failed: {type(error).__name__}"
             )
+
+            if isinstance(error, requests.HTTPError):
+                response = error.response
+
+                if response is not None:
+                    st.error(
+                        f"OpenAlex HTTP status: {response.status_code}"
+                    )
+
+            elif isinstance(error, requests.Timeout):
+                st.warning(
+                    "The request timed out. Please try again."
+                )
+
+            elif isinstance(error, requests.ConnectionError):
+                st.warning(
+                    "Could not connect to OpenAlex. "
+                    "Check your connection or try again later."
+                )
+
 
 papers = st.session_state.get("research_papers", [])
 
